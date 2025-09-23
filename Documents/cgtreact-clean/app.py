@@ -1,0 +1,1253 @@
+# app.py
+# Improved UK RSU/ESPP CGT calculator — single-file enhanced version
+# Features:
+# - Enhanced Audit Dashboard with interactive Transaction Detail table
+# - recalc_all writes calculation_json per fragment for fast UI rendering
+# - /api/transactions paginated endpoint and /api/transaction/<id> trace endpoint
+# - Improved DB schema (calculation_json) with idempotent migrations
+# - Lazy-load trace expansion in the UI, inline SVG micro-graphics, filtering and export links
+#
+# Setup:
+#   pip install flask sqlalchemy flask_sqlalchemy
+#   python app.py
+#
+# Backup data.db before running on live data
+
+from flask import Flask, render_template_string, request, jsonify, redirect, url_for, flash, send_file
+from flask_sqlalchemy import SQLAlchemy
+from flask_cors import CORS
+from datetime import datetime, timedelta, date
+from decimal import Decimal, ROUND_HALF_UP, getcontext, InvalidOperation
+import io, csv, os, sqlite3, json
+import requests
+from selenium import webdriver
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.chrome.options import Options
+from webdriver_manager.chrome import ChromeDriverManager
+import tempfile
+import os
+import time
+
+import zipfile
+
+import xml.etree.ElementTree as ET
+
+from datetime import date
+import statistics
+from statistics import mean
+
+getcontext().prec = 50
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DB_PATH = os.path.join(BASE_DIR, "data.db")
+DB_URI = f"sqlite:///{DB_PATH}"
+DATE_FMT = "%Y-%m-%d"
+
+app = Flask(__name__)
+app.config['SQLALCHEMY_DATABASE_URI'] = DB_URI
+app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+app.secret_key = os.environ.get("FLASK_SECRET", "change-me-to-secret")
+db = SQLAlchemy(app)
+CORS(app)
+
+# ---------- Models ----------
+class Setting(db.Model):
+    __tablename__ = "settings"
+    key = db.Column(db.String(64), primary_key=True)
+    value = db.Column(db.String(256), nullable=False)
+
+class ExchangeRate(db.Model):
+    __tablename__ = "exchange_rates"
+    id = db.Column(db.Integer, primary_key=True)
+    date = db.Column(db.Date, nullable=False, index=True)
+    description = db.Column(db.String(200))
+    usd_gbp = db.Column(db.Numeric(28,12), nullable=False)  # USD per GBP
+    notes = db.Column(db.String(200))
+
+class Vesting(db.Model):
+    __tablename__ = "vesting"
+    id = db.Column(db.Integer, primary_key=True)
+    date = db.Column(db.Date, nullable=False, index=True)
+    shares_vested = db.Column(db.Numeric(28,12), nullable=False)
+    price_usd = db.Column(db.Numeric(28,12))
+    total_usd = db.Column(db.Numeric(28,12))
+    exchange_rate = db.Column(db.Numeric(28,12))
+    total_gbp = db.Column(db.Numeric(28,12))
+    tax_paid_gbp = db.Column(db.Numeric(28,12))
+    shares_sold = db.Column(db.Numeric(28,12), default=Decimal("0"))
+    net_shares = db.Column(db.Numeric(28,12))
+
+class ESPPPurchase(db.Model):
+    __tablename__ = "espp"
+    id = db.Column(db.Integer, primary_key=True)
+    date = db.Column(db.Date, nullable=False, index=True)
+    shares_retained = db.Column(db.Numeric(28,12), nullable=False)
+    purchase_price_usd = db.Column(db.Numeric(28,12))
+    market_price_usd = db.Column(db.Numeric(28,12))
+    discount = db.Column(db.Numeric(28,12))
+    exchange_rate = db.Column(db.Numeric(28,12))
+    total_gbp = db.Column(db.Numeric(28,12))
+    discount_taxed_paye = db.Column(db.Boolean, default=True)
+    paye_tax_gbp = db.Column(db.Numeric(28,12), nullable=True)
+    notes = db.Column(db.String(200))
+
+class SaleInput(db.Model):
+    __tablename__ = "sales_in"
+    id = db.Column(db.Integer, primary_key=True)
+    date = db.Column(db.Date, nullable=False, index=True)
+    shares_sold = db.Column(db.Numeric(28,12), nullable=False)
+    sale_price_usd = db.Column(db.Numeric(28,12))
+    exchange_rate = db.Column(db.Numeric(28,12), nullable=True)
+
+class DisposalResult(db.Model):
+    __tablename__ = "disposal_results"
+    id = db.Column(db.Integer, primary_key=True)
+    sale_date = db.Column(db.Date, index=True)
+    sale_input_id = db.Column(db.Integer)
+    matched_date = db.Column(db.Date)
+    matching_type = db.Column(db.String(32))
+    matched_shares = db.Column(db.Numeric(28,12))
+    avg_cost_gbp = db.Column(db.Numeric(28,12))
+    proceeds_gbp = db.Column(db.Numeric(28,12))
+    cost_basis_gbp = db.Column(db.Numeric(28,12))
+    gain_gbp = db.Column(db.Numeric(28,12))
+    cgt_due_gbp = db.Column(db.Numeric(28,12))
+    calculation_json = db.Column(db.Text)
+
+class PoolSnapshot(db.Model):
+    __tablename__ = "pool_snapshot"
+    id = db.Column(db.Integer, primary_key=True)
+    timestamp = db.Column(db.DateTime, default=datetime.utcnow)
+    tax_year = db.Column(db.Integer, index=True, nullable=True)
+    snapshot_json = db.Column(db.Text)
+    total_shares = db.Column(db.Numeric(28,12))
+    total_cost_gbp = db.Column(db.Numeric(28,12))
+    avg_cost_gbp = db.Column(db.Numeric(28,12))
+
+class CalculationStep(db.Model):
+    __tablename__ = "calculation_steps"
+    id = db.Column(db.Integer, primary_key=True)
+    timestamp = db.Column(db.DateTime, default=datetime.utcnow, index=True)
+    sale_input_id = db.Column(db.Integer, nullable=True, index=True)
+    step_order = db.Column(db.Integer, nullable=False, index=True)
+    message = db.Column(db.Text, nullable=False)
+
+class CalculationDetail(db.Model):
+    __tablename__ = "calculation_details"
+    id = db.Column(db.Integer, primary_key=True)
+    disposal_id = db.Column(db.Integer, nullable=False, index=True)
+    sale_input_id = db.Column(db.Integer, nullable=False, index=True)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow, index=True)
+    equations = db.Column(db.Text, nullable=False)
+    explanation = db.Column(db.Text, nullable=False)
+
+
+# ---------- Utilities ----------
+def to_date(v):
+    if not v:
+        return None
+    if isinstance(v, datetime):
+        return v.date()
+    if isinstance(v, date):
+        return v
+    return datetime.strptime(v, DATE_FMT).date()
+
+def safe_decimal(x, default=Decimal("0")):
+    try:
+        if x is None or x == "":
+            return default
+        if isinstance(x, Decimal):
+            return x
+        return Decimal(str(x))
+    except (InvalidOperation, ValueError):
+        return default
+
+def q2(d: Decimal) -> Decimal:
+    return d.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+def q6(d: Decimal) -> Decimal:
+    return d.quantize(Decimal("0.000001"), rounding=ROUND_HALF_UP)
+
+def get_aea(tax_year):
+    """Get Annual Exempt Amount based on tax year (ending year, e.g., 2024 for 2024/25)"""
+    if tax_year is None:
+        return Decimal("12300")
+    aea_map = {
+        2024: Decimal("3000"),  # 2024/25
+        2023: Decimal("6000"),  # 2023/24
+    }
+    for yr in range(2022, 2020, -1):  # 2022/23 to 2020/21: 12300
+        aea_map[yr] = Decimal("12300")
+    # Default for earlier or future: 12300 pre-2023, 3000 post-2024
+    return aea_map.get(tax_year, Decimal("3000") if tax_year > 2024 else Decimal("12300"))
+
+def load_rates_sorted():
+    rows = ExchangeRate.query.order_by(ExchangeRate.date.asc()).all()
+    year_map = {}
+    for r in rows:
+        year_map[r.date.year] = safe_decimal(r.usd_gbp)
+    return sorted([(y, year_map[y]) for y in year_map.keys()], key=lambda x: x[0])
+
+def get_rate_for_date(target_date, rates_list):
+    if target_date is None:
+        return Decimal("1")
+    # First, try exact date from DB
+    exact_rate = ExchangeRate.query.filter_by(date=target_date).first()
+    if exact_rate:
+        return safe_decimal(exact_rate.usd_gbp)
+    # Fallback to year-based
+    year = target_date.year
+    if not rates_list:
+        return Decimal("1")
+    exact = [r for y, r in rates_list if y == year]
+    if exact:
+        return exact[0]
+    earlier = [(y, r) for y, r in rates_list if y < year]
+    if earlier:
+        return earlier[-1][1]
+    later = [(y, r) for y, r in rates_list if y > year]
+    if later:
+        return later[0][1]
+    return Decimal("1")
+
+def build_fragment_detail_struct(sale_price_usd: Decimal, lot, qty, rate_for_sale, fragment_index):
+    sale_price_usd = safe_decimal(sale_price_usd)
+    qty = safe_decimal(qty)
+    lot_usd_total = safe_decimal(lot.get("usd_total")) if lot.get("usd_total") is not None else None
+    lot_rate_used = safe_decimal(lot.get("rate_used")) if lot.get("rate_used") is not None else None
+    lot_paye = safe_decimal(lot.get("paye")) if lot.get("paye") is not None else Decimal("0")
+
+    proceeds_per_share_gbp = (sale_price_usd / safe_decimal(rate_for_sale)) if safe_decimal(rate_for_sale) != 0 else sale_price_usd
+    proceeds_total = q2(proceeds_per_share_gbp * qty)
+
+    cost_per_share_used = q2(safe_decimal(lot["avg_cost"]))
+    cost_total = q2(cost_per_share_used * qty)
+
+    equations = []
+    equations.append(f"Proceeds per share (GBP) = round(sale_price_usd / rate) = round({sale_price_usd} / {rate_for_sale}) = {q2(proceeds_per_share_gbp)}")
+    equations.append(f"Total proceeds = {q2(proceeds_per_share_gbp)} × {qty} = {proceeds_total}")
+    equations.append(f"Cost per share used = {cost_per_share_used}")
+    equations.append(f"Total cost = {cost_per_share_used} × {qty} = {cost_total}")
+    if lot_usd_total is not None and lot_rate_used is not None:
+        purchase_gbp = q2(lot_usd_total / lot_rate_used) if lot_rate_used != 0 else q2(lot_usd_total)
+        equations.append(f"Lot USD total {lot_usd_total} → GBP = {lot_usd_total} / {lot_rate_used} = {purchase_gbp}")
+        if lot_paye and lot_paye != 0:
+            equations.append(f"PAYE added = £{q2(lot_paye)} → chosen lot total = £{q2(purchase_gbp + lot_paye)}")
+    gain = q2(proceeds_total - cost_total)
+    equations.append(f"Gain = {proceeds_total} − {cost_total} = {gain}")
+
+    numeric_trace = {
+        "sale_price_usd": str(sale_price_usd),
+        "rate_for_sale": str(rate_for_sale),
+        "proceeds_per_share_gbp": str(q2(proceeds_per_share_gbp)),
+        "proceeds_total_gbp": str(proceeds_total),
+        "cost_per_share_gbp": str(cost_per_share_used),
+        "cost_total_gbp": str(cost_total),
+        "gain_gbp": str(gain),
+        "lot_usd_total": str(lot_usd_total) if lot_usd_total is not None else None,
+        "lot_rate_used": str(lot_rate_used) if lot_rate_used is not None else None,
+        "lot_paye_gbp": str(lot_paye) if lot_paye is not None else None,
+        "shares_matched": str(q6(qty)),
+        "fragment_index": int(fragment_index)
+    }
+
+    return {"equations": equations, "numeric_trace": numeric_trace}
+
+# ---------- Core matching & snapshot logic (enhanced) ----------
+def recalc_all(explain=False, tax_year_filter=None):
+    DisposalResult.query.delete()
+    PoolSnapshot.query.delete()
+    CalculationStep.query.delete()
+    CalculationDetail.query.delete()
+    db.session.commit()
+
+    rates = load_rates_sorted()
+    lots = []
+    explanation = []
+    step_idx = 0
+    errors_present = False
+
+    def log_step(msg, sale_input_id=None):
+        nonlocal step_idx
+        step_idx += 1
+        explanation.append((sale_input_id, step_idx, msg))
+        if explain:
+            cs = CalculationStep(sale_input_id=sale_input_id, step_order=step_idx, message=msg)
+            db.session.add(cs)
+
+    log_step("Building lots from Vestings and ESPP purchases (ordered).")
+
+    for v in Vesting.query.order_by(Vesting.date.asc(), Vesting.id.asc()).all():
+        net = safe_decimal(v.net_shares) if v.net_shares is not None else (safe_decimal(v.shares_vested) - safe_decimal(v.shares_sold or 0))
+        if net <= 0:
+            log_step(f"Skip vesting {v.id} net {net}")
+            continue
+        usd_total = safe_decimal(v.total_usd) if v.total_usd else (safe_decimal(v.price_usd) * safe_decimal(v.shares_vested) if v.price_usd else Decimal("0"))
+        exc = safe_decimal(v.exchange_rate) if v.exchange_rate else (get_rate_for_date(v.date, rates) or Decimal("1"))
+        if exc == 0: exc = Decimal("1")
+        total_gbp = (usd_total / exc)
+        avg_cost = (total_gbp / net) if net != 0 else Decimal("0")
+        entry_key = f"V:{v.id}"
+        tooltip = f"RSU {v.date}: USD {usd_total} / rate {exc} → £{q2(total_gbp)}; per-share £{q2(avg_cost)}"
+        lots.append({"date": v.date, "remaining": net, "avg_cost": avg_cost, "usd_total": usd_total, "rate_used": exc, "paye": None, "entry": entry_key, "source": "RSU", "tooltip": tooltip})
+        log_step(f"Added RSU lot {entry_key} shares {net} per-share {q2(avg_cost)}")
+
+    for p in ESPPPurchase.query.order_by(ESPPPurchase.date.asc(), ESPPPurchase.id.asc()).all():
+        shares = safe_decimal(p.shares_retained)
+        if shares <= 0:
+            log_step(f"Skip ESPP {p.id} retained {shares}"); continue
+        purchase_price_usd = safe_decimal(p.purchase_price_usd) if p.purchase_price_usd else Decimal("0")
+        exc = safe_decimal(p.exchange_rate) if p.exchange_rate else (get_rate_for_date(p.date, rates) or Decimal("1"))
+        if exc == 0: exc = Decimal("1")
+        usd_total = purchase_price_usd * shares
+        purchase_gbp = (usd_total / exc) if exc != 0 else usd_total
+        paye = safe_decimal(p.paye_tax_gbp) if p.paye_tax_gbp else Decimal("0")
+        chosen_total_gbp = purchase_gbp + (paye if p.discount_taxed_paye else Decimal("0"))
+        avg_cost = (chosen_total_gbp / shares) if shares != 0 else Decimal("0")
+        entry_key = f"E:{p.id}"
+        tooltip = f"ESPP {p.date}: USD {usd_total} / rate {exc} → purchase £{q2(purchase_gbp)}; PAYE £{q2(paye)}; per-share £{q2(avg_cost)}"
+        lots.append({"date": p.date, "remaining": shares, "avg_cost": avg_cost, "usd_total": usd_total, "rate_used": exc, "paye": (paye if p.paye_tax_gbp else None), "entry": entry_key, "source": "ESPP", "tooltip": tooltip})
+        log_step(f"Added ESPP lot {entry_key} shares {shares} per-share {q2(avg_cost)}")
+
+    lots.sort(key=lambda x: (x["date"], x["entry"]))
+    log_step(f"Total lots built: {len(lots)}")
+
+    sa = Setting.query.get("CGT_Allowance"); sb = Setting.query.get("CGT_Rate")
+    cgt_allowance = safe_decimal(sa.value) if sa and safe_decimal(sa.value) > 0 and (tax_year_filter is None or tax_year_filter <= 2024) else get_aea(tax_year_filter)
+    cgt_rate_pct = safe_decimal(sb.value) if sb else Decimal("20")
+    cgt_rate = cgt_rate_pct / Decimal("100")
+    log_step(f"Using allowance £{q2(cgt_allowance)} for tax year {tax_year_filter if tax_year_filter else 'all'} and rate {q2(cgt_rate_pct)}%.")
+
+    per_sale_snapshots = []
+    all_fragments = []
+
+    sales_all = SaleInput.query.order_by(SaleInput.date.asc(), SaleInput.id.asc()).all()
+    for s in sales_all:
+        log_step(f"Process sale {s.id} date {s.date} shares {safe_decimal(s.shares_sold)}", s.id)
+        remaining = safe_decimal(s.shares_sold)
+        rate_for_sale = safe_decimal(s.exchange_rate) if s.exchange_rate else get_rate_for_date(s.date, rates)
+        if rate_for_sale == Decimal("1") and not rates and not s.exchange_rate:
+            log_step("No year-level FX configured; using 1.0", s.id)
+        fragments = []
+        changed = {}
+
+        for lot in lots:
+            if remaining <= 0: break
+            if lot["date"] == s.date and lot["remaining"] > 0:
+                before = safe_decimal(lot["remaining"])
+                take = min(lot["remaining"], remaining)
+                lot["remaining"] -= take
+                after = safe_decimal(lot["remaining"])
+                changed[lot["entry"]] = {"matching": "Same-day", "before": float(before), "after": float(after), "delta": float(after - before)}
+                fragments.append(("Same-day", lot, take))
+                remaining -= take
+
+        if remaining > 0:
+            window_end = s.date + timedelta(days=30)
+            for lot in lots:
+                if remaining <= 0: break
+                if lot["date"] > s.date and lot["date"] <= window_end and lot["remaining"] > 0:
+                    before = safe_decimal(lot["remaining"])
+                    take = min(lot["remaining"], remaining)
+                    lot["remaining"] -= take
+                    after = safe_decimal(lot["remaining"])
+                    changed[lot["entry"]] = {"matching": "30-day", "before": float(before), "after": float(after), "delta": float(after - before)}
+                    fragments.append(("30-day", lot, take))
+                    remaining -= take
+
+        if remaining > 0:
+            for lot in lots:
+                if remaining <= 0: break
+                if lot["date"] < s.date and lot["remaining"] > 0:
+                    before = safe_decimal(lot["remaining"])
+                    take = min(lot["remaining"], remaining)
+                    lot["remaining"] -= take
+                    after = safe_decimal(lot["remaining"])
+                    changed[lot["entry"]] = {"matching": "Section 104", "before": float(before), "after": float(after), "delta": float(after - before)}
+                    fragments.append(("Section 104", lot, take))
+                    remaining -= take
+
+        if remaining > 0:
+            dr = DisposalResult(sale_date=s.date, sale_input_id=s.id, matched_date=None, matching_type="ERROR: insufficient holdings",
+                                matched_shares=Decimal("0"), avg_cost_gbp=Decimal("0"), proceeds_gbp=Decimal("0"),
+                                cost_basis_gbp=Decimal("0"), gain_gbp=Decimal("0"), cgt_due_gbp=Decimal("0"),
+                                calculation_json=json.dumps({"error": "insufficient holdings", "requested": str(s.shares_sold), "remaining_unmatched": str(remaining)}))
+            db.session.add(dr); db.session.commit()
+            log_step(f"ERROR sale {s.id} insufficient remaining {remaining}", s.id)
+            errors_present = True
+            pool_after = [{"entry": lot["entry"], "date": lot["date"].isoformat(), "source": lot["source"], "remaining": float(lot["remaining"]), "per_share_cost": float(q2(lot["avg_cost"])), "tooltip": lot.get("tooltip","")} for lot in lots]
+            per_sale_snapshots.append({"sale": {"id": s.id, "date": s.date.isoformat(), "shares": float(s.shares_sold)}, "changed": changed, "pool_after": pool_after, "error": True})
+            continue
+
+        frag_index = 0
+        for mtype, lot, qty in fragments:
+            frag_index += 1
+            struct = build_fragment_detail_struct(s.sale_price_usd, lot, qty, rate_for_sale, frag_index)
+            proceeds_total = Decimal(struct["numeric_trace"]["proceeds_total_gbp"])
+            cost_total = Decimal(struct["numeric_trace"]["cost_total_gbp"])
+            gain = Decimal(struct["numeric_trace"]["gain_gbp"])
+            dr = DisposalResult(sale_date=s.date, sale_input_id=s.id, matched_date=lot["date"], matching_type=mtype,
+                                matched_shares=qty, avg_cost_gbp=safe_decimal(lot["avg_cost"]), proceeds_gbp=proceeds_total,
+                                cost_basis_gbp=cost_total, gain_gbp=gain, cgt_due_gbp=Decimal("0"),
+                                calculation_json=json.dumps({"inputs": {"sale_price_usd": str(s.sale_price_usd), "sale_rate_used": str(rate_for_sale), "lot": {"entry": lot["entry"], "date": str(lot["date"]), "source": lot["source"], "usd_total": str(lot.get("usd_total")), "rate_used": str(lot.get("rate_used")), "paye": str(lot.get("paye"))}}, "equations": struct["equations"], "numeric_trace": struct["numeric_trace"]}))
+            db.session.add(dr); db.session.commit()
+            cd = CalculationDetail(disposal_id=dr.id, sale_input_id=s.id, equations="\n".join(struct["equations"]), explanation=f"Fragment {frag_index} matched {qty} from {lot['entry']}")
+            db.session.add(cd); db.session.commit()
+            all_fragments.append(dr)
+
+        pool_after = [{"entry": lot["entry"], "date": lot["date"].isoformat(), "source": lot["source"], "remaining": float(lot["remaining"]), "per_share_cost": float(q2(lot["avg_cost"])), "tooltip": lot.get("tooltip","")} for lot in lots]
+        per_sale_snapshots.append({"sale": {"id": s.id, "date": s.date.isoformat(), "shares": float(s.shares_sold)}, "changed": changed, "pool_after": pool_after, "error": False})
+
+    snaps_by_ty = {}
+    for snap in per_sale_snapshots:
+        sale_date = datetime.fromisoformat(snap["sale"]["date"]).date()
+        ty = sale_date.year if sale_date >= date(sale_date.year,4,6) else sale_date.year - 1
+        snaps_by_ty.setdefault(ty, []).append(snap)
+
+    for ty, snaps in snaps_by_ty.items():
+        total_shares = sum([safe_decimal(lot["remaining"]) for lot in lots])
+        total_cost = sum([safe_decimal(lot["avg_cost"]) * safe_decimal(lot["remaining"]) for lot in lots])
+        avg_cost = (total_cost / total_shares) if total_shares != 0 else Decimal("0")
+        ps = PoolSnapshot(timestamp=datetime.utcnow(), tax_year=ty, snapshot_json=json.dumps(snaps), total_shares=total_shares, total_cost_gbp=total_cost, avg_cost_gbp=avg_cost)
+        db.session.add(ps)
+
+    total_shares = sum([safe_decimal(lot["remaining"]) for lot in lots])
+    total_cost = sum([safe_decimal(lot["avg_cost"]) * safe_decimal(lot["remaining"]) for lot in lots])
+    avg_cost = (total_cost / total_shares) if total_shares != 0 else Decimal("0")
+    ps_final = PoolSnapshot(timestamp=datetime.utcnow(), tax_year=None, snapshot_json=json.dumps(per_sale_snapshots), total_shares=total_shares, total_cost_gbp=total_cost, avg_cost_gbp=avg_cost)
+    db.session.add(ps_final)
+    db.session.commit()
+    log_step("Stored snapshots and final pool snapshot.")
+
+    taxable_summary = None
+    if tax_year_filter is not None and not errors_present:
+        tax_start = date(tax_year_filter,4,6); tax_end = date(tax_year_filter+1,4,5)
+        disposals = DisposalResult.query.filter(DisposalResult.sale_date >= tax_start, DisposalResult.sale_date <= tax_end).all()
+        pos = sum([safe_decimal(d.gain_gbp) for d in disposals if safe_decimal(d.gain_gbp) > 0])
+        neg = sum([abs(safe_decimal(d.gain_gbp)) for d in disposals if safe_decimal(d.gain_gbp) < 0])
+        net_gain = pos - neg
+        if net_gain < 0: net_gain = Decimal("0")
+        sa = Setting.query.get("CGT_Allowance"); sb = Setting.query.get("CGT_Rate")
+        cgt_allowance = safe_decimal(sa.value) if sa and safe_decimal(sa.value) > 0 and tax_year_filter <= 2024 else get_aea(tax_year_filter)
+        cgt_rate_pct = safe_decimal(sb.value) if sb else Decimal("20")
+        cgt_rate = cgt_rate_pct / Decimal("100")
+        taxable = net_gain - cgt_allowance
+        if taxable < 0: taxable = Decimal("0")
+        estimated_cgt = q2(taxable * cgt_rate)
+        taxable_summary = {"pos": float(q2(pos)), "neg": float(q2(neg)), "net_gain": float(q2(net_gain)), "taxable": float(q2(taxable)), "estimated_cgt": float(estimated_cgt)}
+        if pos > 0 and estimated_cgt > 0:
+            for d in disposals:
+                g = safe_decimal(d.gain_gbp)
+                if g > 0:
+                    share = g / pos
+                    alloc = q2(estimated_cgt * share)
+                    d.cgt_due_gbp = alloc
+                    db.session.add(d)
+            db.session.commit()
+
+    return {"per_sale_snapshots": per_sale_snapshots, "errors_present": errors_present, "taxable_summary": taxable_summary}
+
+# ---------- Templates (Audit Dashboard + Editor) ----------
+AUDIT_DASH_HTML = """
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Audit Dashboard</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+  <style>
+    :root{
+      --rsu:#2b7be4; --espp:#00b39f; --same:#198754; --thirty:#ffb703; --s104:#2b7be4; --err:#e03131;
+    }
+    .match-Same-day{background:var(--same);color:white;padding:3px 7px;border-radius:12px;font-size:0.85rem}
+    .match-30-day{background:var(--thirty);color:black;padding:3px 7px;border-radius:12px;font-size:0.85rem}
+    .match-Section-104{background:var(--s104);color:white;padding:3px 7px;border-radius:12px;font-size:0.85rem}
+    .match-ERROR{background:var(--err);color:white;padding:3px 7px;border-radius:12px;font-size:0.85rem}
+    .pool-bar{border:1px solid #e6e9ef;border-radius:4px}
+    pre.eqbox{background:#f8f9fa;padding:8px;border-radius:4px;white-space:pre-wrap;}
+    tr.trace-row td{background:#fbfdff}
+    .small-muted{font-size:0.85rem;color:#6c757d}
+  </style>
+</head>
+<body class="bg-light">
+<div class="container py-3">
+  <div class="d-flex align-items-center mb-3">
+    <h1 class="me-auto">Audit Dashboard</h1>
+    <div>
+      <a class="btn btn-outline-primary me-2" href="{{ url_for('index_full') }}">Editor</a>
+      <a class="btn btn-primary" id="recalc-btn" href="{{ url_for('recalculate') }}">Recalculate & store snapshots</a>
+    </div>
+  </div>
+
+  <div class="row mb-3">
+    <div class="col-md-4">
+      <label class="form-label">Tax year</label>
+      <select id="tax-year" class="form-select">
+        <option value="">All</option>
+        {% for y in tax_years %}
+          <option value="{{ y }}" {% if y==sel_tax_year %}selected{% endif %}>{{ y }} → {{ (y+1) }}</option>
+        {% endfor %}
+      </select>
+    </div>
+    <div class="col-md-4">
+      <label class="form-label">Filter</label>
+      <select id="filter-match" class="form-select">
+        <option value="">All matches</option>
+        <option value="Same-day">Same-day</option>
+        <option value="30-day">30-day</option>
+        <option value="Section 104">Section 104</option>
+        <option value="ERROR">Error</option>
+      </select>
+    </div>
+    <div class="col-md-4">
+      <label class="form-label">Search</label>
+      <input id="search" class="form-control" placeholder="lot id, sale id, date, etc">
+    </div>
+  </div>
+
+  <div class="mb-3">
+    <a id="export-csv" class="btn btn-sm btn-outline-secondary" href="{{ url_for('download_csv', kind='disposals') }}">Download Disposals CSV</a>
+    <a id="export-pool" class="btn btn-sm btn-outline-secondary" href="{{ url_for('download_csv', kind='pool') }}">Download Pool CSV</a>
+    <a id="export-summary" class="btn btn-sm btn-outline-secondary" href="{{ url_for('download_csv', kind='summary') }}">Download Summary CSV</a>
+  </div>
+
+  <div id="txn-table-wrapper">
+    <table class="table table-sm table-hover" id="txn-table">
+      <thead>
+        <tr>
+          <th>Disposal Date</th><th>Sale ID</th><th>Frag</th><th>Units</th><th>Match</th><th>Lot</th><th>Event Date</th>
+          <th>Source</th><th>Rate</th><th>Cost/Share</th><th>Proceeds</th><th>Cost</th><th>Gain</th><th>Pool after</th><th></th>
+        </tr>
+      </thead>
+      <tbody id="txn-body"></tbody>
+    </table>
+    <div id="no-data" class="text-muted">No transactions loaded. Use Recalculate to generate snapshots and transactions.</div>
+  </div>
+
+</div>
+
+<script>
+  const apiListUrl = "/api/transactions";
+  const txBody = document.getElementById("txn-body");
+  const noData = document.getElementById("no-data");
+  const taxYearEl = document.getElementById("tax-year");
+  const filterMatch = document.getElementById("filter-match");
+  const searchEl = document.getElementById("search");
+
+  function fmt(num, d=2){ return Number(num).toLocaleString(undefined,{minimumFractionDigits:d,maximumFractionDigits:d}) }
+
+  async function loadTransactions(){
+    const params = new URLSearchParams();
+    if(taxYearEl.value) params.set("tax_year", taxYearEl.value);
+    if(filterMatch.value) params.set("matching", filterMatch.value);
+    if(searchEl.value) params.set("q", searchEl.value);
+    params.set("limit", "1000");
+    const res = await fetch(apiListUrl + "?" + params.toString());
+    const data = await res.json();
+    txBody.innerHTML = "";
+    if(!data.items || data.items.length===0){ noData.style.display="block"; return; } else { noData.style.display="none"; }
+    for(const frag of data.items){
+      const tr = document.createElement("tr");
+      const matchClass = "match-" + (frag.matching_type ? frag.matching_type.replace(" ","-") : "ERROR");
+      tr.innerHTML = `
+        <td>${frag.sale_date}</td>
+        <td><a href="#sale-${frag.sale_input_id}">${frag.sale_input_id}</a></td>
+        <td>${frag.fragment_index}</td>
+        <td>${fmt(frag.matched_shares,6)}</td>
+        <td><span class="${matchClass}">${frag.matching_type}</span></td>
+        <td><a href="#" class="lot-link" data-lot="${frag.lot_entry}">${frag.lot_entry || ''}</a></td>
+        <td>${frag.matched_date || ''}</td>
+        <td>${frag.source || ''}</td>
+        <td>${frag.rate_used || ''}</td>
+        <td>£${fmt(frag.avg_cost_gbp)}</td>
+        <td>£${fmt(frag.proceeds_gbp)}</td>
+        <td>£${fmt(frag.cost_basis_gbp)}</td>
+        <td>£${fmt(frag.gain_gbp)}</td>
+        <td><svg width="120" height="14" class="pool-bar" role="img" aria-label="pool"></svg></td>
+        <td><button class="btn btn-sm btn-outline-secondary btn-trace" data-id="${frag.disposal_id}">View trace</button></td>
+      `;
+      txBody.appendChild(tr);
+
+      const tr2 = document.createElement("tr");
+      tr2.className = "trace-row";
+      tr2.style.display = "none";
+      tr2.innerHTML = `<td colspan="15"><div id="trace-${frag.disposal_id}">Loading trace...</div></td>`;
+      txBody.appendChild(tr2);
+
+      const svg = tr.querySelector("svg.pool-bar");
+      try{
+        const rsu = Number(frag.pool_rsu_pct || 0);
+        const espp = Number(frag.pool_espp_pct || 0);
+        const w = 120;
+        svg.innerHTML = '';
+        const ns = 'http://www.w3.org/2000/svg';
+        const rectBg = document.createElementNS(ns,'rect');
+        rectBg.setAttribute('x',0); rectBg.setAttribute('y',0); rectBg.setAttribute('width',w); rectBg.setAttribute('height',14); rectBg.setAttribute('fill','none'); rectBg.setAttribute('stroke','#e6e9ef');
+        svg.appendChild(rectBg);
+        let x = 0;
+        if(rsu > 0){
+          const rW = Math.max(1, Math.round(w * rsu));
+          const rRect = document.createElementNS(ns,'rect');
+          rRect.setAttribute('x',x); rRect.setAttribute('y',0); rRect.setAttribute('width',rW); rRect.setAttribute('height',14); rRect.setAttribute('fill','#2b7be4');
+          svg.appendChild(rRect); x += rW;
+        }
+        if(espp > 0){
+          const eW = Math.max(1, Math.round(w * espp));
+          const eRect = document.createElementNS(ns,'rect');
+          eRect.setAttribute('x',x); eRect.setAttribute('y',0); eRect.setAttribute('width',eW); eRect.setAttribute('height',14); eRect.setAttribute('fill','#00b39f');
+          svg.appendChild(eRect); x += eW;
+        }
+      }catch(e){}
+    }
+  }
+
+  async function fetchTrace(id){
+    const el = document.getElementById('trace-' + id);
+    if(!el) return;
+    el.innerHTML = 'Loading trace...';
+    const res = await fetch('/api/transaction/' + id);
+    if(!res.ok){ el.innerHTML = '<div class="text-danger">Failed to load trace</div>'; return; }
+    const data = await res.json();
+    let html = '<div class="p-2">';
+    html += `<h6>Disposal ${data.disposal_id} — Fragment</h6>`;
+    if(data.calculation && data.calculation.equations){
+      html += '<pre class="eqbox">' + data.calculation.equations.join('\\n') + '</pre>';
+    } else if(data.details && data.details.length){
+      for(const d of data.details){
+        html += '<pre class="eqbox">' + d.equations + '</pre>';
+      }
+    } else {
+      html += '<div class="small-muted">No detailed equations available.</div>';
+    }
+    if(data.calculation && data.calculation.numeric_trace){
+      const nt = data.calculation.numeric_trace;
+      html += '<dl class="row mt-2">';
+      html += `<dt class="col-3">Sale price (USD)</dt><dd class="col-9">$${nt.sale_price_usd}</dd>`;
+      html += `<dt class="col-3">Sale rate used</dt><dd class="col-9">${nt.rate_for_sale}</dd>`;
+      html += `<dt class="col-3">Proceeds total (GBP)</dt><dd class="col-9">£${nt.proceeds_total_gbp}</dd>`;
+      html += `<dt class="col-3">Cost total (GBP)</dt><dd class="col-9">£${nt.cost_total_gbp}</dd>`;
+      html += `<dt class="col-3">Gain (GBP)</dt><dd class="col-9">£${nt.gain_gbp}</dd>`;
+      html += '</dl>';
+    }
+    html += '<details class="mt-2"><summary class="small-muted">Raw JSON</summary><pre class="eqbox">' + JSON.stringify(data, null, 2) + '</pre></details>';
+    html += '</div>';
+    el.innerHTML = html;
+  }
+
+  document.addEventListener('click', function(e){
+    if(e.target && e.target.classList.contains('btn-trace')){
+      const id = e.target.getAttribute('data-id');
+      const tr = e.target.closest('tr');
+      const traceRow = tr.nextElementSibling;
+      if(!traceRow) return;
+      if(traceRow.style.display === 'none' || traceRow.style.display === ''){
+        traceRow.style.display = '';
+        fetchTrace(id);
+      } else {
+        traceRow.style.display = 'none';
+      }
+    }
+  });
+
+  document.getElementById('tax-year').addEventListener('change', loadTransactions);
+  document.getElementById('filter-match').addEventListener('change', loadTransactions);
+  document.getElementById('search').addEventListener('input', function(){ setTimeout(loadTransactions, 300); });
+
+  loadTransactions();
+</script>
+
+</body>
+</html>
+"""
+
+# ---------- CRUD and route handlers (Editor + Preview) ----------
+INDEX_FULL_HTML = """
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>Editor</title>
+<link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet"></head>
+<body class="bg-light">
+<div class="container py-3">
+  <h1>Editor</h1>
+  <p><a href="{{ url_for('index') }}">Preview</a> | <a href="{{ url_for('audit') }}">Audit</a></p>
+
+  <h4>Exchange Rates</h4>
+  <div class="mb-2">
+    <form action="{{ url_for('upload_boe_csv') }}" method="post" enctype="multipart/form-data" class="row g-2">
+      <div class="col-auto">
+        <input type="file" name="csv_file" accept=".csv" class="form-control form-control-sm" required>
+      </div>
+      <div class="col-auto">
+        <a href="https://www.bankofengland.co.uk/boeapps/database/fromshowcolumns.asp?Travel=NIxIRxRSxSUx&FromSeries=1&ToSeries=50&DAT=RNG&FD=1&FM=Jan&FY=2020&TD=31&TM=Dec&TY=2025&FNY=&CSVF=TT&html.x=265&html.y=40&C=C8P&Filter=N#" target="_blank" class="btn btn-sm btn-outline-secondary">Download BoE CSV</a>
+      </div>
+      <div class="col-auto">
+        <button type="submit" class="btn btn-sm btn-secondary">Upload BoE CSV</button>
+      </div>
+    </form>
+  </div>
+  <form action="{{ url_for('add_rate') }}" method="post" class="row g-2 mb-2">
+    <div class="col-4"><input name="date" type="date" class="form-control" required></div>
+    <div class="col-4"><input name="rate" type="number" step="0.000001" class="form-control" required></div>
+    <div class="col-4"><button class="btn btn-sm btn-primary">Add rate</button></div>
+  </form>
+  <table class="table table-sm"><thead><tr><th>Date</th><th>USD→GBP</th><th></th></tr></thead>
+    <tbody>{% for r in rates %}<tr><td>{{ r.date }}</td><td>{{ r.usd_gbp }}</td><td><a class="btn btn-sm btn-outline-danger" href="{{ url_for('delete_rate', id=r.id) }}">Delete</a></td></tr>{% else %}<tr><td colspan=3>No rates</td></tr>{% endfor %}</tbody></table>
+
+  <h4>Vestings</h4>
+  <form action="{{ url_for('add_vesting') }}" method="post" class="row g-2 mb-2">
+    <div class="col-3"><input name="date" type="date" class="form-control" required></div>
+    <div class="col-3"><input name="shares_vested" type="number" step="0.000001" class="form-control" required></div>
+    <div class="col-3"><input name="price_usd" type="number" step="0.000001" class="form-control" placeholder="price USD"></div>
+    <div class="col-3"><input name="shares_sold" type="number" step="0.000001" class="form-control" placeholder="already sold"></div>
+    <div class="col-12 mt-2"><button class="btn btn-sm btn-success">Add vesting</button></div>
+  </form>
+  <table class="table table-sm"><thead><tr><th>Date</th><th>Shares</th><th>Price USD</th><th></th></tr></thead>
+    <tbody>{% for v in vestings %}<tr><td>{{ v.date }}</td><td>{{ v.shares_vested }}</td><td>{{ v.price_usd or '' }}</td><td><a class="btn btn-sm btn-outline-primary" href="{{ url_for('edit_vesting', id=v.id) }}">Edit</a> <a class="btn btn-sm btn-outline-danger" href="{{ url_for('delete_vesting', id=v.id) }}">Delete</a></td></tr>{% else %}<tr><td colspan=4>No vestings</td></tr>{% endfor %}</tbody></table>
+
+  <h4>ESPP</h4>
+  <form action="{{ url_for('add_espp') }}" method="post" class="row g-2 mb-2">
+    <div class="col-3"><input name="date" type="date" class="form-control" required></div>
+    <div class="col-3"><input name="shares_retained" type="number" step="0.000001" class="form-control" required></div>
+    <div class="col-3"><input name="purchase_price_usd" type="number" step="0.000001" class="form-control"></div>
+    <div class="col-3"><input name="market_price_usd" type="number" step="0.000001" class="form-control"></div>
+    <div class="col-6 mt-2"><input name="paye_tax_gbp" class="form-control" placeholder="PAYE GBP (opt)"></div>
+    <div class="col-6 mt-2"><input name="exchange_rate" class="form-control" placeholder="USD per GBP (opt)"></div>
+    <div class="col-12 mt-2 form-check"><input class="form-check-input" type="checkbox" id="discount_taxed" name="discount_taxed" checked><label class="form-check-label" for="discount_taxed">Discount taxed under PAYE</label></div>
+    <div class="col-12 mt-2"><button class="btn btn-sm btn-warning">Add ESPP</button></div>
+  </form>
+  <table class="table table-sm"><thead><tr><th>Date</th><th>Shares</th><th>Purchase</th><th></th></tr></thead>
+    <tbody>{% for e in espps %}<tr><td>{{ e.date }}</td><td>{{ e.shares_retained }}</td><td>{{ e.purchase_price_usd or '' }}</td><td><a class="btn btn-sm btn-outline-primary" href="{{ url_for('edit_espp', id=e.id) }}">Edit</a> <a class="btn btn-sm btn-outline-danger" href="{{ url_for('delete_espp', id=e.id) }}">Delete</a></td></tr>{% else %}<tr><td colspan=4>No ESPP</td></tr>{% endfor %}</tbody></table>
+
+  <h4>Sales</h4>
+  <form action="{{ url_for('add_sale') }}" method="post" class="row g-2 mb-2">
+    <div class="col-4"><input name="date" type="date" class="form-control" required></div>
+    <div class="col-4"><input name="shares_sold" type="number" step="0.000001" class="form-control" required></div>
+    <div class="col-4"><input name="sale_price_usd" type="number" step="0.000001" class="form-control" required></div>
+    <div class="col-12 mt-2"><button class="btn btn-sm btn-danger">Add sale</button></div>
+  </form>
+  <table class="table table-sm"><thead><tr><th>Date</th><th>Shares</th><th>Price USD</th><th></th></tr></thead>
+    <tbody>{% for s in sales %}<tr><td>{{ s.date }}</td><td>{{ s.shares_sold }}</td><td>{{ s.sale_price_usd }}</td><td><a class="btn btn-sm btn-outline-primary" href="{{ url_for('edit_sale', id=s.id) }}">Edit</a> <a class="btn btn-sm btn-outline-danger" href="{{ url_for('delete_sale', id=s.id) }}">Delete</a></td></tr>{% else %}<tr><td colspan=4>No sales</td></tr>{% endfor %}</tbody></table>
+
+</div>
+</body>
+</html>
+"""
+
+INDEX_HTML = """
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>UK RSU/ESPP CGT</title>
+<link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+<style>.lot-tooltip { cursor: help; text-decoration: underline dotted; }</style>
+</head>
+<body class="bg-light">
+<div class="container py-3">
+  <h1>UK RSU / ESPP CGT</h1>
+  <div class="mb-2">
+    <a class="btn btn-outline-secondary btn-sm" href="{{ url_for('index_full') }}">Editor</a>
+    <a class="btn btn-outline-secondary btn-sm" href="{{ url_for('audit') }}">Audit</a>
+  </div>
+  <div class="row">
+    <div class="col-md-8">
+      <h5>Lot preview</h5>
+      <table class="table table-sm">
+        <thead><tr><th>Lot</th><th>Date</th><th>Source</th><th>Remaining</th><th>Per-share GBP</th><th>Info</th></tr></thead>
+        <tbody>
+          {% for lot in computed_lots %}
+            <tr>
+              <td>{{ lot.entry }}</td>
+              <td>{{ lot.date }}</td>
+              <td>{{ lot.source }}</td>
+              <td>{{ '%.6f'|format(lot.remaining) }}</td>
+              <td>£{{ '%.2f'|format(lot.avg_cost) }}</td>
+              <td><span class="lot-tooltip" title="{{ lot.tooltip }}">details</span></td>
+            </tr>
+          {% else %}
+            <tr><td colspan="6">No lots</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+      <a class="btn btn-primary" href="{{ url_for('recalculate') }}">Recalculate & store snapshots</a>
+    </div>
+    <div class="col-md-4">
+      <h5>Quick links</h5>
+      <p><a class="btn btn-sm btn-secondary" href="{{ url_for('download_csv', kind='disposals') }}">Download Disposals CSV</a></p>
+      <p><a class="btn btn-sm btn-secondary" href="{{ url_for('download_csv', kind='pool') }}">Download Pool CSV</a></p>
+      <p><a class="btn btn-sm btn-secondary" href="{{ url_for('download_csv', kind='summary') }}">Download Summary CSV</a></p>
+    </div>
+  </div>
+</div>
+</body>
+</html>
+"""
+
+# ---------- CRUD and route handlers ----------
+
+@app.route("/upload_boe_csv", methods=["POST"])
+def upload_boe_csv():
+    if "csv_file" not in request.files:
+        flash("No file part", "danger")
+        return redirect(url_for("index_full"))
+    file = request.files["csv_file"]
+    if file.filename == "":
+        flash("No selected file", "danger")
+        return redirect(url_for("index_full"))
+    if not file.filename.lower().endswith(".csv"):
+        flash("File must be a CSV", "danger")
+        return redirect(url_for("index_full"))
+    try:
+        content = file.read().decode("utf-8")
+        stream = io.StringIO(content, newline=None)
+        reader = csv.reader(stream)
+        if not reader:  # empty file
+            flash("Empty CSV file", "danger")
+            return redirect(url_for("index_full"))
+        next(reader, None)  # skip header
+        existing_dates = set(r.date for r in ExchangeRate.query.all())
+        inserted = 0
+        for row in reader:
+            if len(row) < 2:
+                continue
+            date_str = row[0].strip().strip('"')
+            rate_str = row[1].strip().strip('"')
+            if not date_str or not rate_str:
+                continue
+            try:
+                dt = datetime.strptime(date_str, "%d %b %y").date()
+                if dt.year < 2010 or dt.year > 2025:
+                    continue
+                usd_gbp = safe_decimal(rate_str)
+                if usd_gbp and usd_gbp > 0 and dt not in existing_dates:
+                    er = ExchangeRate(
+                        date=dt,
+                        usd_gbp=usd_gbp,
+                        description=f"BoE daily spot {dt}",
+                        notes="Uploaded from BoE CSV"
+                    )
+                    db.session.add(er)
+                    inserted += 1
+                    existing_dates.add(dt)
+            except ValueError:
+                continue
+        db.session.commit()
+        flash(f"Inserted {inserted} daily rates from BoE CSV", "success")
+    except Exception as e:
+        db.session.rollback()
+        flash(f"Error processing CSV: {str(e)}", "danger")
+    return redirect(url_for("index_full"))
+
+@app.route("/")
+def index():
+    rates = load_rates_sorted()
+    lots = []
+    for v in Vesting.query.order_by(Vesting.date.asc(), Vesting.id.asc()).all():
+        net = safe_decimal(v.net_shares) if v.net_shares is not None else (safe_decimal(v.shares_vested) - safe_decimal(v.shares_sold or 0))
+        if net <= 0: continue
+        usd_total = safe_decimal(v.total_usd) if v.total_usd else (safe_decimal(v.price_usd) * safe_decimal(v.shares_vested) if v.price_usd else Decimal("0"))
+        exc = safe_decimal(v.exchange_rate) if v.exchange_rate else (get_rate_for_date(v.date, rates) or Decimal("1"))
+        if exc == 0: exc = Decimal("1")
+        total_gbp = usd_total / exc
+        avg_cost = (total_gbp / net) if net != 0 else Decimal("0")
+        lots.append({"entry": f"V:{v.id}", "date": v.date, "source":"RSU", "remaining": float(net), "avg_cost": float(q2(avg_cost)), "tooltip": f"RSU {v.date}: USD {usd_total} / rate {exc} → £{q2(total_gbp)}; per-share £{q2(avg_cost)}"})
+    for p in ESPPPurchase.query.order_by(ESPPPurchase.date.asc(), ESPPPurchase.id.asc()).all():
+        shares = safe_decimal(p.shares_retained)
+        if shares <= 0: continue
+        purchase_price_usd = safe_decimal(p.purchase_price_usd)
+        exc = safe_decimal(p.exchange_rate) if p.exchange_rate else (get_rate_for_date(p.date, rates) or Decimal("1"))
+        if exc == 0: exc = Decimal("1")
+        usd_total = purchase_price_usd * shares
+        purchase_gbp = usd_total / exc
+        paye = safe_decimal(p.paye_tax_gbp) if p.paye_tax_gbp else Decimal("0")
+        chosen_total_gbp = purchase_gbp + (paye if p.discount_taxed_paye else Decimal("0"))
+        avg_cost = (chosen_total_gbp / shares) if shares != 0 else Decimal("0")
+        lots.append({"entry": f"E:{p.id}", "date": p.date, "source":"ESPP", "remaining": float(shares), "avg_cost": float(q2(avg_cost)), "tooltip": f"ESPP {p.date}: USD {usd_total} / rate {exc} → purchase £{q2(purchase_gbp)}; PAYE £{q2(paye)}; per-share £{q2(avg_cost)}"})
+    rates_q = ExchangeRate.query.order_by(ExchangeRate.date.asc()).all()
+    return render_template_string(INDEX_HTML, computed_lots=lots, rates=rates_q)
+
+@app.route("/index-full")
+def index_full():
+    vestings = Vesting.query.order_by(Vesting.date.asc()).all()
+    espps = ESPPPurchase.query.order_by(ESPPPurchase.date.asc()).all()
+    sales = SaleInput.query.order_by(SaleInput.date.asc()).all()
+    relevant_dates = set()
+    for v in vestings:
+        relevant_dates.add(v.date)
+    for e in espps:
+        relevant_dates.add(e.date)
+    for s in sales:
+        relevant_dates.add(s.date)
+    rates = ExchangeRate.query.filter(ExchangeRate.date.in_(list(relevant_dates))).order_by(ExchangeRate.date.asc()).all()
+    return render_template_string(INDEX_FULL_HTML, rates=rates, vestings=vestings, espps=espps, sales=sales)
+
+# ExchangeRate CRUD
+@app.route("/add_rate", methods=["POST"])
+def add_rate():
+    d = to_date(request.form.get("date"))
+    rate = safe_decimal(request.form.get("rate"))
+    if not d or rate <= 0: flash("Invalid rate", "danger"); return redirect(url_for("index_full"))
+    db.session.add(ExchangeRate(date=d, usd_gbp=rate, description="", notes=""))
+    db.session.commit(); flash("Rate added", "success"); return redirect(url_for("index_full"))
+
+@app.route("/delete_rate/<int:id>")
+def delete_rate(id):
+    r = ExchangeRate.query.get(id)
+    if r: db.session.delete(r); db.session.commit(); flash("Rate deleted", "info")
+    return redirect(url_for("index_full"))
+
+@app.route("/edit_rate/<int:id>", methods=["GET","POST"])
+def edit_rate(id):
+    r = ExchangeRate.query.get_or_404(id)
+    if request.method=="POST":
+        r.date = to_date(request.form.get("date")); r.usd_gbp = safe_decimal(request.form.get("rate"))
+        db.session.add(r); db.session.commit(); flash("Rate updated","success"); return redirect(url_for("index_full"))
+    return f"<form method='post'><input type='date' name='date' value='{r.date}' required><input type='number' step='0.000001' name='rate' value='{r.usd_gbp}' required><button>Save</button></form>"
+
+# Vesting CRUD
+@app.route("/add_vesting", methods=["POST"])
+def add_vesting():
+    d = to_date(request.form.get("date"))
+    shares = safe_decimal(request.form.get("shares_vested"))
+    price = request.form.get("price_usd")
+    sold = safe_decimal(request.form.get("shares_sold") or "0")
+    if not d or shares <= 0: flash("Invalid vesting", "danger"); return redirect(url_for("index_full"))
+    v = Vesting(date=d, shares_vested=shares, price_usd=safe_decimal(price) if price else None, shares_sold=sold, net_shares=(shares - sold))
+    db.session.add(v); db.session.commit(); flash("Vesting added","success"); return redirect(url_for("index_full"))
+
+@app.route("/edit_vesting/<int:id>", methods=["GET","POST"])
+def edit_vesting(id):
+    v = Vesting.query.get_or_404(id)
+    if request.method=="POST":
+        v.date = to_date(request.form.get("date")); v.shares_vested = safe_decimal(request.form.get("shares_vested"))
+        v.price_usd = safe_decimal(request.form.get("price_usd")) if request.form.get("price_usd") else None
+        v.shares_sold = safe_decimal(request.form.get("shares_sold") or "0"); v.net_shares = v.shares_vested - v.shares_sold
+        db.session.add(v); db.session.commit(); flash("Vesting updated","success"); return redirect(url_for("index_full"))
+    return f"<form method='post'><input type='date' name='date' value='{v.date}' required><input type='number' step='0.000001' name='shares_vested' value='{v.shares_vested}' required><input type='number' step='0.000001' name='price_usd' value='{v.price_usd or ''}'><input type='number' step='0.000001' name='shares_sold' value='{v.shares_sold or 0}'><button>Save</button></form>"
+
+@app.route("/delete_vesting/<int:id>")
+def delete_vesting(id):
+    v = Vesting.query.get(id)
+    if v: db.session.delete(v); db.session.commit(); flash("Vesting deleted","info")
+    return redirect(url_for("index_full"))
+
+# ESPP CRUD
+@app.route("/add_espp", methods=["POST"])
+def add_espp():
+    d = to_date(request.form.get("date"))
+    shares = safe_decimal(request.form.get("shares_retained"))
+    purchase = request.form.get("purchase_price_usd")
+    market = request.form.get("market_price_usd")
+    paye = request.form.get("paye_tax_gbp")
+    exch = request.form.get("exchange_rate")
+    discount_taxed = True if request.form.get("discount_taxed")=="on" else False
+    if not d or shares <= 0: flash("Invalid ESPP","danger"); return redirect(url_for("index_full"))
+    p = ESPPPurchase(date=d, shares_retained=shares, purchase_price_usd=safe_decimal(purchase) if purchase else None, market_price_usd=safe_decimal(market) if market else None, paye_tax_gbp=safe_decimal(paye) if paye else None, exchange_rate=safe_decimal(exch) if exch else None, discount_taxed_paye=discount_taxed)
+    db.session.add(p); db.session.commit(); flash("ESPP added","success"); return redirect(url_for("index_full"))
+
+@app.route("/edit_espp/<int:id>", methods=["GET","POST"])
+def edit_espp(id):
+    p = ESPPPurchase.query.get_or_404(id)
+    if request.method=="POST":
+        p.date = to_date(request.form.get("date")); p.shares_retained = safe_decimal(request.form.get("shares_retained"))
+        p.purchase_price_usd = safe_decimal(request.form.get("purchase_price_usd")) if request.form.get("purchase_price_usd") else None
+        p.market_price_usd = safe_decimal(request.form.get("market_price_usd")) if request.form.get("market_price_usd") else None
+        p.paye_tax_gbp = safe_decimal(request.form.get("paye_tax_gbp")) if request.form.get("paye_tax_gbp") else None
+        p.exchange_rate = safe_decimal(request.form.get("exchange_rate")) if request.form.get("exchange_rate") else None
+        p.discount_taxed_paye = True if request.form.get("discount_taxed")=="on" else False
+        db.session.add(p); db.session.commit(); flash("ESPP updated","success"); return redirect(url_for("index_full"))
+    return f"<form method='post'><input type='date' name='date' value='{p.date}' required><input type='number' step='0.000001' name='shares_retained' value='{p.shares_retained}' required><input type='number' step='0.000001' name='purchase_price_usd' value='{p.purchase_price_usd or ''}'><input type='number' step='0.000001' name='market_price_usd' value='{p.market_price_usd or ''}'><input type='number' step='0.000001' name='paye_tax_gbp' value='{p.paye_tax_gbp or ''}'><input type='number' step='0.000001' name='exchange_rate' value='{p.exchange_rate or ''}'><label><input type='checkbox' name='discount_taxed' {'checked' if p.discount_taxed_paye else ''}> Discount taxed</label><button>Save</button></form>"
+
+@app.route("/delete_espp/<int:id>")
+def delete_espp(id):
+    p = ESPPPurchase.query.get(id)
+    if p: db.session.delete(p); db.session.commit(); flash("ESPP deleted","info")
+    return redirect(url_for("index_full"))
+
+# Sale CRUD
+@app.route("/add_sale", methods=["POST"])
+def add_sale():
+    d = to_date(request.form.get("date"))
+    shares = safe_decimal(request.form.get("shares_sold"))
+    price = request.form.get("sale_price_usd")
+    exch = request.form.get("exchange_rate")
+    if not d or shares <= 0 or not price: flash("Invalid sale","danger"); return redirect(url_for("index_full"))
+    s = SaleInput(date=d, shares_sold=shares, sale_price_usd=safe_decimal(price), exchange_rate=safe_decimal(exch) if exch else None)
+    db.session.add(s); db.session.commit(); flash("Sale added","success"); return redirect(url_for("index_full"))
+
+@app.route("/edit_sale/<int:id>", methods=["GET","POST"])
+def edit_sale(id):
+    s = SaleInput.query.get_or_404(id)
+    if request.method=="POST":
+        s.date = to_date(request.form.get("date")); s.shares_sold = safe_decimal(request.form.get("shares_sold"))
+        s.sale_price_usd = safe_decimal(request.form.get("sale_price_usd")); s.exchange_rate = safe_decimal(request.form.get("exchange_rate")) if request.form.get("exchange_rate") else None
+        db.session.add(s); db.session.commit(); flash("Sale updated","success"); return redirect(url_for("index_full"))
+    return f"<form method='post'><input type='date' name='date' value='{s.date}' required><input type='number' step='0.000001' name='shares_sold' value='{s.shares_sold}' required><input type='number' step='0.000001' name='sale_price_usd' value='{s.sale_price_usd}' required><input type='number' step='0.000001' name='exchange_rate' value='{s.exchange_rate or ''}'><button>Save</button></form>"
+
+@app.route("/delete_sale/<int:id>")
+def delete_sale(id):
+    s = SaleInput.query.get(id)
+    if s: db.session.delete(s); db.session.commit(); flash("Sale deleted","info")
+    return redirect(url_for("index_full"))
+
+# Recalculate & audit
+@app.route("/recalculate")
+def recalculate():
+    explain_flag = True if request.args.get("explain") == "1" else False
+    ty = request.args.get("tax_year")
+    tax_year = int(ty) if ty and ty.isdigit() else None
+    res = recalc_all(explain=explain_flag, tax_year_filter=tax_year)
+    if res.get("errors_present"): flash("Recalc completed but errors detected. See Audit.", "danger")
+    else: flash("Recalc completed and snapshots stored.", "success")
+    return redirect(url_for("index"))
+
+@app.route("/audit")
+def audit():
+    ty = request.args.get("tax_year")
+    sel_tax_year = int(ty) if ty and ty.isdigit() else None
+    tax_years = list(range(datetime.utcnow().year - 9, datetime.utcnow().year + 1))
+    return render_template_string(AUDIT_DASH_HTML, tax_years=tax_years, sel_tax_year=sel_tax_year)
+
+# CSV exports
+@app.route("/download/<kind>")
+def download_csv(kind):
+    tax_year_q = request.args.get("tax_year")
+    today = datetime.utcnow().date()
+    default_tax_year = today.year if today >= date(today.year,4,6) else today.year - 1
+    tax_year = int(tax_year_q) if tax_year_q and tax_year_q.isdigit() else default_tax_year
+    si = io.StringIO(); cw = csv.writer(si)
+    if kind == "disposals":
+        rows = DisposalResult.query.order_by(DisposalResult.sale_date.asc(), DisposalResult.id.asc()).all()
+        cw.writerow(["disposal_id","sale_date","sale_input_id","matched_date","matching_type","matched_shares","avg_cost_gbp","proceeds_gbp","cost_basis_gbp","gain_gbp","cgt_due_gbp"])
+        for r in rows:
+            cw.writerow([r.id, r.sale_date.isoformat() if r.sale_date else "", r.sale_input_id, r.matched_date.isoformat() if r.matched_date else "", r.matching_type, float(r.matched_shares or 0), float(q2(safe_decimal(r.avg_cost_gbp))), float(q2(safe_decimal(r.proceeds_gbp))), float(q2(safe_decimal(r.cost_basis_gbp))), float(q2(safe_decimal(r.gain_gbp))), float(q2(safe_decimal(r.cgt_due_gbp)))])
+        buf = io.BytesIO(); buf.write(si.getvalue().encode()); buf.seek(0); return send_file(buf, mimetype="text/csv", as_attachment=True, download_name="disposals.csv")
+    elif kind == "pool":
+        snaps = PoolSnapshot.query.order_by(PoolSnapshot.timestamp.desc()).limit(50).all()
+        cw.writerow(["timestamp","tax_year","total_shares","total_cost_gbp","avg_cost_gbp","snapshot_json"])
+        for s in snaps:
+            cw.writerow([s.timestamp.isoformat(), s.tax_year if s.tax_year else "", float(q6(s.total_shares or 0)), float(q2(s.total_cost_gbp or 0)), float(q2(s.avg_cost_gbp or 0)), s.snapshot_json])
+        buf = io.BytesIO(); buf.write(si.getvalue().encode()); buf.seek(0); return send_file(buf, mimetype="text/csv", as_attachment=True, download_name="pool_snapshots.csv")
+    elif kind == "summary":
+        tax_start = date(tax_year,4,6); tax_end = date(tax_year+1,4,5)
+        disposals = DisposalResult.query.filter(DisposalResult.sale_date >= tax_start, DisposalResult.sale_date <= tax_end).order_by(DisposalResult.sale_date.asc()).all()
+        total_proceeds = sum([safe_decimal(r.proceeds_gbp or 0) for r in disposals])
+        total_cost = sum([safe_decimal(r.cost_basis_gbp or 0) for r in disposals])
+        total_gain = sum([safe_decimal(r.gain_gbp or 0) for r in disposals])
+        pos = sum([safe_decimal(r.gain_gbp) for r in disposals if safe_decimal(r.gain_gbp) > 0])
+        neg = sum([abs(safe_decimal(r.gain_gbp)) for r in disposals if safe_decimal(r.gain_gbp) < 0])
+        net_gain = pos - neg
+        if net_gain < 0: net_gain = Decimal("0")
+        sa = Setting.query.get("CGT_Allowance"); sb = Setting.query.get("CGT_Rate")
+        cgt_allowance = safe_decimal(sa.value) if sa and safe_decimal(sa.value) > 0 and tax_year <= 2024 else get_aea(tax_year)
+        cgt_rate_pct = safe_decimal(sb.value) if sb else Decimal("20")
+        cgt_rate = cgt_rate_pct / Decimal("100")
+        taxable = net_gain - cgt_allowance
+        if taxable < 0: taxable = Decimal("0")
+        estimated_cgt = q2(taxable * cgt_rate)
+        cw.writerow(["tax_year_start","tax_year_end","cgt_allowance_gbp","cgt_rate_percent","total_disposals","total_proceeds","total_cost","total_gain","net_gain","taxable_after_allowance","estimated_cgt"])
+        cw.writerow([tax_start.isoformat(), tax_end.isoformat(), float(q2(cgt_allowance)), float(q2(cgt_rate_pct)), len(disposals), float(q2(total_proceeds)), float(q2(total_cost)), float(q2(total_gain)), float(q2(net_gain)), float(q2(taxable)), float(q2(estimated_cgt))])
+        buf = io.BytesIO(); buf.write(si.getvalue().encode()); buf.seek(0); return send_file(buf, mimetype="text/csv", as_attachment=True, download_name=f"summary_{tax_year}.csv")
+    else:
+        return "Unknown kind", 404
+
+@app.route("/clear_steps", methods=["POST"])
+def clear_steps():
+    CalculationStep.query.delete(); CalculationDetail.query.delete(); db.session.commit(); flash("Cleared steps and details", "info"); return redirect(url_for("audit"))
+
+# ---------- API endpoints for UI ----------
+@app.route("/api/transactions")
+def api_transactions():
+    ty = request.args.get("tax_year")
+    matching = request.args.get("matching")
+    q = request.args.get("q")
+    limit = int(request.args.get("limit") or 500)
+    items = []
+    query = DisposalResult.query.order_by(DisposalResult.sale_date.asc(), DisposalResult.id.asc())
+    rows = query.limit(5000).all()
+
+    for r in rows:
+        calc = {}
+        if r.calculation_json:
+            try:
+                calc = json.loads(r.calculation_json)
+            except Exception:
+                calc = {}
+        pool_rsu_pct = 0.0
+        pool_espp_pct = 0.0
+        frag_idx = None
+        if calc.get("numeric_trace") and calc["numeric_trace"].get("fragment_index"):
+            frag_idx = calc["numeric_trace"]["fragment_index"]
+        item = {
+            "disposal_id": r.id,
+            "sale_date": r.sale_date.isoformat() if r.sale_date else None,
+            "sale_input_id": r.sale_input_id,
+            "fragment_index": frag_idx or 1,
+            "matched_shares": float(q6(safe_decimal(r.matched_shares or 0))),
+            "matching_type": r.matching_type,
+            "lot_entry": calc.get("inputs",{}).get("lot",{}).get("entry") if calc.get("inputs") else None,
+            "matched_date": r.matched_date.isoformat() if r.matched_date else None,
+            "source": calc.get("inputs",{}).get("lot",{}).get("source") if calc.get("inputs") else None,
+            "rate_used": calc.get("inputs",{}).get("sale_rate_used") if calc.get("inputs") else None,
+            "avg_cost_gbp": float(q2(safe_decimal(r.avg_cost_gbp or 0))),
+            "proceeds_gbp": float(q2(safe_decimal(r.proceeds_gbp or 0))),
+            "cost_basis_gbp": float(q2(safe_decimal(r.cost_basis_gbp or 0))),
+            "gain_gbp": float(q2(safe_decimal(r.gain_gbp or 0))),
+            "pool_rsu_pct": pool_rsu_pct,
+            "pool_espp_pct": pool_espp_pct,
+            "calculation_snippet": (calc.get("equations")[:3] if calc.get("equations") else [])
+        }
+        items.append(item)
+
+    if matching:
+        items = [i for i in items if i.get("matching_type") == matching]
+    if q:
+        ql = q.lower()
+        items = [i for i in items if ql in (str(i.get("lot_entry") or "")).lower() or ql in (str(i.get("sale_input_id") or ""))]
+    items = items[:limit]
+    return jsonify({"items": items, "count": len(items)})
+
+@app.route("/api/transaction/<int:id>")
+def api_transaction(id):
+    r = DisposalResult.query.get_or_404(id)
+    calc = {}
+    if r.calculation_json:
+        try:
+            calc = json.loads(r.calculation_json)
+        except Exception:
+            calc = {"raw": r.calculation_json}
+    details = CalculationDetail.query.filter_by(disposal_id=r.id).order_by(CalculationDetail.created_at.asc()).all()
+    details_list = [{"equations": d.equations, "explanation": d.explanation} for d in details]
+    return jsonify({
+        "disposal_id": r.id,
+        "sale_date": r.sale_date.isoformat() if r.sale_date else None,
+        "sale_input_id": r.sale_input_id,
+        "matched_date": r.matched_date.isoformat() if r.matched_date else None,
+        "matching_type": r.matching_type,
+        "matched_shares": str(r.matched_shares),
+        "avg_cost_gbp": str(r.avg_cost_gbp),
+        "proceeds_gbp": str(r.proceeds_gbp),
+        "cost_basis_gbp": str(r.cost_basis_gbp),
+        "gain_gbp": str(r.gain_gbp),
+        "cgt_due_gbp": str(r.cgt_due_gbp),
+        "calculation": calc,
+        "details": details_list
+    })
+
+@app.route("/api/snapshot/<int:year>")
+def api_snapshot(year):
+    snapshot = PoolSnapshot.query.filter_by(tax_year=year).order_by(PoolSnapshot.timestamp.desc()).first()
+    if not snapshot:
+        return jsonify({"error": "No snapshot for year"}), 404
+    return jsonify({
+        "timestamp": snapshot.timestamp.isoformat(),
+        "tax_year": snapshot.tax_year,
+        "total_shares": float(q6(safe_decimal(snapshot.total_shares or 0))),
+        "total_cost_gbp": float(q2(safe_decimal(snapshot.total_cost_gbp or 0))),
+        "avg_cost_gbp": float(q2(safe_decimal(snapshot.avg_cost_gbp or 0))),
+        "snapshot_json": snapshot.snapshot_json
+    })
+
+@app.route("/api/summary/<int:year>")
+def api_summary(year):
+    tax_start = date(year, 4, 6)
+    tax_end = date(year + 1, 4, 5)
+    disposals = DisposalResult.query.filter(
+        DisposalResult.sale_date >= tax_start,
+        DisposalResult.sale_date <= tax_end
+    ).order_by(DisposalResult.sale_date.asc()).all()
+    
+    total_proceeds = sum([safe_decimal(r.proceeds_gbp or 0) for r in disposals])
+    total_cost = sum([safe_decimal(r.cost_basis_gbp or 0) for r in disposals])
+    total_gain = sum([safe_decimal(r.gain_gbp or 0) for r in disposals])
+    pos = sum([safe_decimal(r.gain_gbp) for r in disposals if safe_decimal(r.gain_gbp) > 0])
+    neg = sum([abs(safe_decimal(r.gain_gbp)) for r in disposals if safe_decimal(r.gain_gbp) < 0])
+    net_gain = pos - neg
+    if net_gain < 0:
+        net_gain = Decimal("0")
+    
+    sa = Setting.query.get("CGT_Allowance")
+    sb = Setting.query.get("CGT_Rate")
+    cgt_allowance = safe_decimal(sa.value) if sa and safe_decimal(sa.value) > 0 and year <= 2024 else get_aea(year)
+    cgt_rate_pct = safe_decimal(sb.value) if sb else Decimal("20")
+    cgt_rate = cgt_rate_pct / Decimal("100")
+    taxable = net_gain - cgt_allowance
+    if taxable < 0:
+        taxable = Decimal("0")
+    estimated_cgt = q2(taxable * cgt_rate)
+    
+    return jsonify({
+        "tax_year_start": tax_start.isoformat(),
+        "tax_year_end": tax_end.isoformat(),
+        "cgt_allowance_gbp": float(q2(cgt_allowance)),
+        "cgt_rate_percent": float(q2(cgt_rate_pct)),
+        "total_disposals": len(disposals),
+        "total_proceeds": float(q2(total_proceeds)),
+        "total_cost": float(q2(total_cost)),
+        "total_gain": float(q2(total_gain)),
+        "net_gain": float(q2(net_gain)),
+        "taxable_after_allowance": float(q2(taxable)),
+        "estimated_cgt": float(q2(estimated_cgt))
+    })
+
+# ---------- Migration helper and bootstrap ----------
+def ensure_db_schema():
+    if not os.path.exists(DB_PATH):
+        return
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    def has_col(table, col):
+        try:
+            c.execute(f"PRAGMA table_info({table})")
+            return col in [r[1] for r in c.fetchall()]
+        except Exception:
+            return False
+    try:
+        c.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='espp'")
+        if c.fetchone():
+            if not has_col("espp", "shares_retained"): c.execute("ALTER TABLE espp ADD COLUMN shares_retained NUMERIC")
+            if not has_col("espp", "purchase_price_usd"): c.execute("ALTER TABLE espp ADD COLUMN purchase_price_usd NUMERIC")
+            if not has_col("espp", "market_price_usd"): c.execute("ALTER TABLE espp ADD COLUMN market_price_usd NUMERIC")
+            if not has_col("espp", "discount_taxed_paye"): c.execute("ALTER TABLE espp ADD COLUMN discount_taxed_paye BOOLEAN")
+            if not has_col("espp", "paye_tax_gbp"): c.execute("ALTER TABLE espp ADD COLUMN paye_tax_gbp NUMERIC")
+            if not has_col("espp", "exchange_rate"): c.execute("ALTER TABLE espp ADD COLUMN exchange_rate NUMERIC")
+    except Exception:
+        pass
+    try:
+        c.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='sales_in'")
+        if c.fetchone():
+            if not has_col("sales_in", "exchange_rate"): c.execute("ALTER TABLE sales_in ADD COLUMN exchange_rate NUMERIC")
+    except Exception:
+        pass
+    try:
+        c.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='pool_snapshot'")
+        if c.fetchone():
+            if not has_col("pool_snapshot", "tax_year"): c.execute("ALTER TABLE pool_snapshot ADD COLUMN tax_year INTEGER")
+            if not has_col("pool_snapshot", "snapshot_json"): c.execute("ALTER TABLE pool_snapshot ADD COLUMN snapshot_json TEXT")
+            if not has_col("pool_snapshot", "total_shares"): c.execute("ALTER TABLE pool_snapshot ADD COLUMN total_shares NUMERIC")
+            if not has_col("pool_snapshot", "total_cost_gbp"): c.execute("ALTER TABLE pool_snapshot ADD COLUMN total_cost_gbp NUMERIC")
+            if not has_col("pool_snapshot", "avg_cost_gbp"): c.execute("ALTER TABLE pool_snapshot ADD COLUMN avg_cost_gbp NUMERIC")
+    except Exception:
+        pass
+    try:
+        c.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='disposal_results'")
+        if c.fetchone():
+            if not has_col("disposal_results", "calculation_json"): c.execute("ALTER TABLE disposal_results ADD COLUMN calculation_json TEXT")
+    except Exception:
+        pass
+    conn.commit()
+    conn.close()
+
+def bootstrap():
+    with app.app_context():
+        ensure_db_schema()
+        db.create_all()
+        if not Setting.query.get("CGT_Allowance"): db.session.add(Setting(key="CGT_Allowance", value="0"))  # 0 means use dynamic
+        if not Setting.query.get("CGT_Rate"): db.session.add(Setting(key="CGT_Rate", value="20"))
+        db.session.commit()
+
+if __name__ == "__main__":
+    bootstrap()
+    app.run(debug=True, host="0.0.0.0", port=5002)
