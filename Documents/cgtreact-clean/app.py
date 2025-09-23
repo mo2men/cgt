@@ -346,10 +346,10 @@ def recalc_all(explain=False, tax_year_filter=None):
                 remaining -= take
 
         if remaining > 0:
-            window_end = s.date + timedelta(days=30)
+            window_start = s.date - timedelta(days=30)
             for lot in lots:
                 if remaining <= 0: break
-                if lot["date"] > s.date and lot["date"] <= window_end and lot["remaining"] > 0:
+                if lot["date"] >= window_start and lot["date"] < s.date and lot["remaining"] > 0:
                     before = safe_decimal(lot["remaining"])
                     take = min(lot["remaining"], remaining)
                     lot["remaining"] -= take
@@ -359,16 +359,41 @@ def recalc_all(explain=False, tax_year_filter=None):
                     remaining -= take
 
         if remaining > 0:
-            for lot in lots:
-                if remaining <= 0: break
-                if lot["date"] < s.date and lot["remaining"] > 0:
+            # Section 104 pooling: compute average from all prior remaining lots
+            prior_lots = [lot for lot in lots if lot["date"] < s.date and safe_decimal(lot["remaining"]) > 0]
+            if prior_lots:
+                prior_shares = sum(safe_decimal(lot["remaining"]) for lot in prior_lots)
+                prior_cost = sum(safe_decimal(lot["avg_cost"]) * safe_decimal(lot["remaining"]) for lot in prior_lots)
+                avg_cost_s104 = prior_cost / prior_shares if prior_shares > 0 else Decimal("0")
+                take = remaining
+                cost_total_s104 = avg_cost_s104 * take
+                # Deplete prior lots FIFO
+                depleted_take = Decimal("0")
+                for lot in prior_lots:
+                    if take <= 0: break
+                    this_take = min(safe_decimal(lot["remaining"]), take)
                     before = safe_decimal(lot["remaining"])
-                    take = min(lot["remaining"], remaining)
-                    lot["remaining"] -= take
+                    lot["remaining"] -= this_take
                     after = safe_decimal(lot["remaining"])
                     changed[lot["entry"]] = {"matching": "Section 104", "before": float(before), "after": float(after), "delta": float(after - before)}
-                    fragments.append(("Section 104", lot, take))
-                    remaining -= take
+                    take -= this_take
+                    depleted_take += this_take
+                # Create virtual lot for fragment
+                virtual_lot = {
+                    "entry": "S104_POOL",
+                    "date": s.date,
+                    "source": "POOLED",
+                    "avg_cost": avg_cost_s104,
+                    "usd_total": None,
+                    "rate_used": None,
+                    "paye": None,
+                    "tooltip": f"s104 average from prior lots: £{q2(avg_cost_s104)} for {depleted_take} shares"
+                }
+                fragments.append(("Section 104", virtual_lot, depleted_take))
+                remaining = 0
+                log_step(f"s104 match: {depleted_take} shares at avg £{q2(avg_cost_s104)}", s.id)
+            else:
+                log_step("s104: No prior lots available", s.id)
 
         if remaining > 0:
             dr = DisposalResult(sale_date=s.date, sale_input_id=s.id, matched_date=None, matching_type="ERROR: insufficient holdings",
@@ -990,6 +1015,36 @@ def edit_sale(id):
 def delete_sale(id):
     s = SaleInput.query.get(id)
     if s: db.session.delete(s); db.session.commit(); flash("Sale deleted","info")
+    return redirect(url_for("index_full"))
+
+# Carry-forward loss CRUD
+@app.route("/add_carry_loss", methods=["POST"])
+def add_carry_loss():
+    tax_year = int(request.form.get("tax_year"))
+    amount = safe_decimal(request.form.get("amount"))
+    notes = request.form.get("notes", "")
+    if not tax_year or amount is None:
+        flash("Invalid carry-forward loss", "danger")
+        return redirect(url_for("index_full"))
+    # Update or add
+    loss = CarryForwardLoss.query.filter_by(tax_year=tax_year).first()
+    if loss:
+        loss.amount = amount
+        loss.notes = notes
+    else:
+        loss = CarryForwardLoss(tax_year=tax_year, amount=amount, notes=notes)
+        db.session.add(loss)
+    db.session.commit()
+    flash(f"Carry-forward loss for {tax_year} updated to £{q2(amount)}", "success")
+    return redirect(url_for("index_full"))
+
+@app.route("/delete_carry_loss/<int:tax_year>")
+def delete_carry_loss(tax_year):
+    loss = CarryForwardLoss.query.filter_by(tax_year=tax_year).first()
+    if loss:
+        db.session.delete(loss)
+        db.session.commit()
+        flash(f"Carry-forward loss for {tax_year} deleted", "info")
     return redirect(url_for("index_full"))
 
 # Recalculate & audit

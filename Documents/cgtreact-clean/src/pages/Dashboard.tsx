@@ -87,9 +87,22 @@ const Dashboard = () => {
         // Map summary to expected shape
         const mappedSummary = {
           tax_year: selectedYear,
+          tax_year_start: summaryRes.tax_year_start,
+          tax_year_end: summaryRes.tax_year_end,
+          cgt_allowance_gbp: summaryRes.cgt_allowance_gbp,
+          allowance_used_gbp: summaryRes.allowance_used_gbp,
+          taxable_income: summaryRes.taxable_income,
+          basic_limit: summaryRes.basic_limit,
+          basic_gain: summaryRes.basic_gain,
+          higher_gain: summaryRes.higher_gain,
+          effective_rate_percent: summaryRes.effective_rate_percent,
+          total_disposals: summaryRes.total_disposals,
+          total_proceeds: summaryRes.total_proceeds,
+          total_cost: summaryRes.total_cost,
           total_gain: summaryRes.total_gain,
-          allowance_used: summaryRes.cgt_allowance_gbp,
-          tax_due: summaryRes.estimated_cgt,
+          net_gain: summaryRes.net_gain,
+          taxable_after_allowance: summaryRes.taxable_after_allowance,
+          estimated_cgt: summaryRes.estimated_cgt,
         };
 
         setStore({
