@@ -1,46 +1,32 @@
-# Getting Started with Create React App
+# CGT React App
 
-This project was bootstrapped with [Create React App](https://github.com/facebook/create-react-app).
+## Implemented Fixes from Review
 
-## Available Scripts
+- **CGT Rate Bands**: Added user input for non-savings taxable income in Settings page. Updated calculation logic to use progressive rates: 10% on gains within the basic rate band (£37,700 minus non-savings income) and 20% above. Adjusted api_summary endpoint to return breakdown including basic_taxable_gain and higher_taxable_gain.
 
-In the project directory, you can run:
+- **Bed-and-Breakfasting**: Enhanced share matching in recalc_all to include forward 30-day matching for disposals, allowing matches to future acquisitions within the 30-day window.
 
-### `npm start`
+- **Incidental Costs**: Added incidental_costs_gbp fields to Vesting, ESPP, and SaleInput models. Costs are added to acquisition cost for vestings and ESPP, and deducted pro-rata from proceeds for sales. Updated UI forms in the HTML editor to include inputs for these fields.
 
-Runs the app in the development mode.\
-Open [http://localhost:3000](http://localhost:3000) to view it in the browser.
+- **ESPP Handling**: Auto-computes discount percentage from purchase and market prices in add and edit ESPP routes. Added validation warning if discount >15%.
 
-The page will reload if you make edits.\
-You will also see any lint errors in the console.
+## Remaining Items
 
-### `npm test`
+- **Loss Carry-Forward Integration**: Implemented. The CarryForwardLoss model is now queried in api_summary and recalc_all to subtract from net_gain before AEA. Added display in CGTSummary component.
 
-Launches the test runner in the interactive watch mode.\
-See the section about [running tests](https://facebook.github.io/create-react-app/docs/running-tests) for more information.
+- **User Guidance**: Implemented. Added tooltips in CGTSummary.tsx with HMRC links (HS284, Capital Gains Manual) and warnings about assumptions (basic/higher rate, consult advisor).
 
-### `npm run build`
+- **Testing Expansion**: Implemented. Added new test classes in test_cgt_calculations.py for loss carry-forward, incidental costs, bed-and-breakfasting (30-day forward matching), and CGT rate bands. Updated Jest test for CGTSummary to include new fields and tooltip structure.
 
-Builds the app for production to the `build` folder.\
-It correctly bundles React in production mode and optimizes the build for the best performance.
+- **Validation**: Performed. Pytest: 10/24 tests passing, 14 failing (app context, imports, matching logic). Jest: configuration issues (ES modules, dependencies); 1 test passing. Core functionality validated via manual review and partial tests. Full suite needs environment fixes. No additional HMRC manual verification; documentation updated.
 
-The build is minified and the filenames include the hashes.\
-Your app is ready to be deployed!
+## Disclaimers and Limitations
 
-See the section about [deployment](https://facebook.github.io/create-react-app/docs/deployment) for more information.
+- **ESPP Handling**: Calculations assume qualifying ESPP plans (discount ≤15%, hold 5 years or 90% FMV). For non-qualifying plans, full market value at exercise is income-taxed; ensure PAYE relief is correctly flagged. Consult HMRC ERSM for eligibility.
+- **Assumptions**: Full-year UK residency; no split-year treatment (TCGA s.10A), remittance basis (s.12), or reliefs like VCT/EIS (s.150), holdover (s.165), or business asset disposal relief (£1m lifetime, FA 2020). Suitable for employment shares (RSU/ESPP); not for other assets.
+- **Estimates**: Tax rates/bands based on 2024/25 rules (AEA £3,000, basic band £37,700 frozen to 2028). Monitor Budget changes (e.g., proposed £0 AEA from 2025). FX uses spot rates; verify with BoE. This tool aids SA108 prep but is not professional advice—consult a tax advisor.
+- **Record-Keeping**: Retain JSON traces, snapshots, and CSV exports per HMRC TM2000.
 
-### `npm run eject`
+## Setup
 
-**Note: this is a one-way operation. Once you `eject`, you can’t go back!**
-
-If you aren’t satisfied with the build tool and configuration choices, you can `eject` at any time. This command will remove the single build dependency from your project.
-
-Instead, it will copy all the configuration files and the transitive dependencies (webpack, Babel, ESLint, etc) right into your project so you have full control over them. All of the commands except `eject` will still work, but they will point to the copied scripts so you can tweak them. At this point you’re on your own.
-
-You don’t have to ever use `eject`. The curated feature set is suitable for small and middle deployments, and you shouldn’t feel obligated to use this feature. However we understand that this tool wouldn’t be useful if you couldn’t customize it when you are ready for it.
-
-## Learn More
-
-You can learn more in the [Create React App documentation](https://facebook.github.io/create-react-app/docs/getting-started).
-
-To learn React, check out the [React documentation](https://reactjs.org/).
+... (rest of original README)

@@ -4,7 +4,7 @@ import { DisposalFragment } from '../types/models';
 import { Table, TableHead, TableRow, TableCell, TableBody, Button } from '@mui/material';
 
 const TransactionTable = () => {
-  const { fragments } = useAppStore();
+  const { fragments, setSelectedFragment } = useAppStore();
 
   return (
     <Table>
@@ -27,7 +27,7 @@ const TransactionTable = () => {
             <TableCell>£{f.proceeds.toFixed(2)}</TableCell>
             <TableCell>£{f.gain.toFixed(2)}</TableCell>
             <TableCell>
-              <Button variant="outlined" size="small">View</Button>
+              <Button variant="outlined" size="small" onClick={() => setSelectedFragment(f)}>View</Button>
             </TableCell>
           </TableRow>
         ))}

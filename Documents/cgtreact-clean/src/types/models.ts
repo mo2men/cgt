@@ -1,38 +1,131 @@
+export interface BackendDisposalFragment {
+  disposal_id: number;
+  sale_date: string | null;
+  sale_input_id: number;
+  fragment_index: number;
+  matched_shares: number;
+  matching_type: string;
+  lot_entry: string | null;
+  matched_date: string | null;
+  source: string | null;
+  rate_used: string | null;
+  avg_cost_gbp: number;
+  proceeds_gbp: number;
+  cost_basis_gbp: number;
+  gain_gbp: number;
+  pool_rsu_pct: number;
+  pool_espp_pct: number;
+  calculation_snippet: string[];
+}
+
 export interface DisposalFragment {
-    id: string;
-    sale_date: string;
-    match_type: string;
-    acquisition_cost: number;
-    proceeds: number;
-    gain: number;
-    trace: any;
-  }
-  
-  export interface PoolSnapshot {
-    tax_year: string;
-    lots: {
-      source: string;
-      quantity: number;
-      cost: number;
-    }[];
-  }
-  
-  export interface CGTSummary {
-    tax_year: string;
-    tax_year_start: string;
-    tax_year_end: string;
-    cgt_allowance_gbp: number;
-    allowance_used_gbp: number;
-    taxable_income: number;
-    basic_limit: number;
-    basic_gain: number;
-    higher_gain: number;
-    effective_rate_percent: number;
-    total_disposals: number;
-    total_proceeds: number;
-    total_cost: number;
-    total_gain: number;
-    net_gain: number;
-    taxable_after_allowance: number;
-    estimated_cgt: number;
-  }
+  id: number;
+  sale_date: string;
+  match_type: string;
+  acquisition_cost: number;
+  proceeds: number;
+  gain: number;
+  matched_shares: number;
+  avg_cost_gbp: number;
+  cost_basis_gbp: number;
+  lot_entry?: string;
+  matched_date?: string;
+  source?: string;
+  rate_used?: string;
+  trace?: any;
+}
+
+export interface Vesting {
+  id: number;
+  date: string;
+  shares_vested: number;
+  price_usd?: number;
+  total_usd?: number;
+  exchange_rate?: number;
+  total_gbp?: number;
+  tax_paid_gbp?: number;
+  incidental_costs_gbp?: number;
+  shares_sold?: number;
+  net_shares?: number;
+}
+
+export interface Espp {
+  id: number;
+  date: string;
+  shares_retained: number;
+  purchase_price_usd?: number;
+  market_price_usd?: number;
+  discount?: number;
+  exchange_rate?: number;
+  total_gbp?: number;
+  discount_taxed_paye: boolean;
+  paye_tax_gbp?: number;
+  qualifying: boolean;
+  incidental_costs_gbp?: number;
+  notes?: string;
+}
+
+export interface Sale {
+  id: number;
+  date: string;
+  shares_sold: number;
+  sale_price_usd?: number;
+  exchange_rate?: number;
+  incidental_costs_gbp?: number;
+}
+
+export interface PoolSnapshot {
+  timestamp: string;
+  tax_year?: number;
+  total_shares: number;
+  total_cost_gbp: number;
+  avg_cost_gbp: number;
+  snapshot_json: string;
+  lots: {
+    source: string;
+    quantity: number;
+    cost: number;
+  }[];
+}
+
+export interface BackendCGTSummary {
+  tax_year_start: string;
+  tax_year_end: string;
+  cgt_allowance_gbp: number;
+  carry_forward_loss_gbp: number;
+  net_gain_after_losses: number;
+  non_savings_income: number;
+  basic_threshold: number;
+  basic_band_available: number;
+  total_disposals: number;
+  total_proceeds: number;
+  total_cost: number;
+  total_gain: number;
+  net_gain: number;
+  taxable_after_allowance: number;
+  basic_taxable_gain: number;
+  higher_taxable_gain: number;
+  estimated_cgt: number;
+}
+
+export interface CGTSummary {
+  tax_year: string;
+  tax_year_start: string;
+  tax_year_end: string;
+  cgt_allowance_gbp: number;
+  carry_forward_loss_gbp: number;
+  net_gain_after_losses: number;
+  allowance_used_gbp: number;
+  taxable_income: number;
+  basic_limit: number;
+  basic_gain: number;
+  higher_gain: number;
+  effective_rate_percent: number;
+  total_disposals: number;
+  total_proceeds: number;
+  total_cost: number;
+  total_gain: number;
+  net_gain: number;
+  taxable_after_allowance: number;
+  estimated_cgt: number;
+}

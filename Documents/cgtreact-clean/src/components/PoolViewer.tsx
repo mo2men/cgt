@@ -4,7 +4,7 @@ import { Typography, Table, TableHead, TableRow, TableCell, TableBody } from '@m
 
 const PoolViewer = () => {
   const { snapshots, selectedYear } = useAppStore();
-  const snapshot = snapshots.find(s => s.tax_year === selectedYear);
+  const snapshot = snapshots.find(s => s.tax_year === parseInt(selectedYear.split('-')[0]));
 
   if (!snapshot) return <Typography>No snapshot for {selectedYear}</Typography>;
 

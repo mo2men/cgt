@@ -77,6 +77,7 @@ class Vesting(db.Model):
     exchange_rate = db.Column(db.Numeric(28,12))
     total_gbp = db.Column(db.Numeric(28,12))
     tax_paid_gbp = db.Column(db.Numeric(28,12))
+    incidental_costs_gbp = db.Column(db.Numeric(28,12), default=Decimal("0"))
     shares_sold = db.Column(db.Numeric(28,12), default=Decimal("0"))
     net_shares = db.Column(db.Numeric(28,12))
 
@@ -92,6 +93,8 @@ class ESPPPurchase(db.Model):
     total_gbp = db.Column(db.Numeric(28,12))
     discount_taxed_paye = db.Column(db.Boolean, default=True)
     paye_tax_gbp = db.Column(db.Numeric(28,12), nullable=True)
+    qualifying = db.Column(db.Boolean, default=True)
+    incidental_costs_gbp = db.Column(db.Numeric(28,12), default=Decimal("0"))
     notes = db.Column(db.String(200))
 
 class SaleInput(db.Model):
@@ -101,6 +104,7 @@ class SaleInput(db.Model):
     shares_sold = db.Column(db.Numeric(28,12), nullable=False)
     sale_price_usd = db.Column(db.Numeric(28,12))
     exchange_rate = db.Column(db.Numeric(28,12), nullable=True)
+    incidental_costs_gbp = db.Column(db.Numeric(28,12), default=Decimal("0"))
 
 class DisposalResult(db.Model):
     __tablename__ = "disposal_results"
@@ -135,6 +139,12 @@ class CalculationStep(db.Model):
     step_order = db.Column(db.Integer, nullable=False, index=True)
     message = db.Column(db.Text, nullable=False)
 
+class CarryForwardLoss(db.Model):
+    __tablename__ = "carry_forward_losses"
+    tax_year = db.Column(db.Integer, primary_key=True)
+    amount = db.Column(db.Numeric(28,12), nullable=False)
+    notes = db.Column(db.String(200))
+
 class CalculationDetail(db.Model):
     __tablename__ = "calculation_details"
     id = db.Column(db.Integer, primary_key=True)
@@ -165,8 +175,8 @@ def safe_decimal(x, default=Decimal("0")):
     except (InvalidOperation, ValueError):
         return default
 
-def q2(d: Decimal) -> Decimal:
-    return d.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+def q2(d) -> Decimal:
+    return safe_decimal(d).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
 
 def q6(d: Decimal) -> Decimal:
     return d.quantize(Decimal("0.000001"), rounding=ROUND_HALF_UP)
@@ -288,12 +298,12 @@ def recalc_all(explain=False, tax_year_filter=None):
         usd_total = safe_decimal(v.total_usd) if v.total_usd else (safe_decimal(v.price_usd) * safe_decimal(v.shares_vested) if v.price_usd else Decimal("0"))
         exc = safe_decimal(v.exchange_rate) if v.exchange_rate else (get_rate_for_date(v.date, rates) or Decimal("1"))
         if exc == 0: exc = Decimal("1")
-        total_gbp = (usd_total / exc)
+        total_gbp = (usd_total / exc) + safe_decimal(v.incidental_costs_gbp or 0)
         avg_cost = (total_gbp / net) if net != 0 else Decimal("0")
         entry_key = f"V:{v.id}"
-        tooltip = f"RSU {v.date}: USD {usd_total} / rate {exc} → £{q2(total_gbp)}; per-share £{q2(avg_cost)}"
+        tooltip = f"RSU {v.date}: USD {usd_total} / rate {exc} → £{q2(total_gbp - safe_decimal(v.incidental_costs_gbp or 0))}; incidental £{q2(v.incidental_costs_gbp or 0)}; per-share £{q2(avg_cost)}"
         lots.append({"date": v.date, "remaining": net, "avg_cost": avg_cost, "usd_total": usd_total, "rate_used": exc, "paye": None, "entry": entry_key, "source": "RSU", "tooltip": tooltip})
-        log_step(f"Added RSU lot {entry_key} shares {net} per-share {q2(avg_cost)}")
+        log_step(f"Added RSU lot {entry_key} shares {net} per-share {q2(avg_cost)} (incidental {q2(v.incidental_costs_gbp or 0)})")
 
     for p in ESPPPurchase.query.order_by(ESPPPurchase.date.asc(), ESPPPurchase.id.asc()).all():
         shares = safe_decimal(p.shares_retained)
@@ -303,23 +313,26 @@ def recalc_all(explain=False, tax_year_filter=None):
         exc = safe_decimal(p.exchange_rate) if p.exchange_rate else (get_rate_for_date(p.date, rates) or Decimal("1"))
         if exc == 0: exc = Decimal("1")
         usd_total = purchase_price_usd * shares
-        purchase_gbp = (usd_total / exc) if exc != 0 else usd_total
+        purchase_gbp = (usd_total / exc) if exc != 0 else usd_total + safe_decimal(p.incidental_costs_gbp or 0)
         paye = safe_decimal(p.paye_tax_gbp) if p.paye_tax_gbp else Decimal("0")
         chosen_total_gbp = purchase_gbp + (paye if p.discount_taxed_paye else Decimal("0"))
         avg_cost = (chosen_total_gbp / shares) if shares != 0 else Decimal("0")
         entry_key = f"E:{p.id}"
-        tooltip = f"ESPP {p.date}: USD {usd_total} / rate {exc} → purchase £{q2(purchase_gbp)}; PAYE £{q2(paye)}; per-share £{q2(avg_cost)}"
+        tooltip = f"ESPP {p.date}: USD {usd_total} / rate {exc} → purchase £{q2(purchase_gbp - safe_decimal(p.incidental_costs_gbp or 0))}; incidental £{q2(p.incidental_costs_gbp or 0)}; PAYE £{q2(paye)}; per-share £{q2(avg_cost)}"
         lots.append({"date": p.date, "remaining": shares, "avg_cost": avg_cost, "usd_total": usd_total, "rate_used": exc, "paye": (paye if p.paye_tax_gbp else None), "entry": entry_key, "source": "ESPP", "tooltip": tooltip})
-        log_step(f"Added ESPP lot {entry_key} shares {shares} per-share {q2(avg_cost)}")
+        log_step(f"Added ESPP lot {entry_key} shares {shares} per-share {q2(avg_cost)} (incidental {q2(p.incidental_costs_gbp or 0)})")
 
     lots.sort(key=lambda x: (x["date"], x["entry"]))
     log_step(f"Total lots built: {len(lots)}")
 
-    sa = Setting.query.get("CGT_Allowance"); sb = Setting.query.get("CGT_Rate")
+    sa = Setting.query.get("CGT_Allowance"); sb = Setting.query.get("CGT_Rate"); sc = Setting.query.get("NonSavingsIncome"); sd = Setting.query.get("BasicBandThreshold")
     cgt_allowance = safe_decimal(sa.value) if sa and safe_decimal(sa.value) > 0 and (tax_year_filter is None or tax_year_filter <= 2024) else get_aea(tax_year_filter)
-    cgt_rate_pct = safe_decimal(sb.value) if sb else Decimal("20")
-    cgt_rate = cgt_rate_pct / Decimal("100")
-    log_step(f"Using allowance £{q2(cgt_allowance)} for tax year {tax_year_filter if tax_year_filter else 'all'} and rate {q2(cgt_rate_pct)}%.")
+    non_savings_income = safe_decimal(sc.value) if sc else Decimal("0")
+    basic_threshold = safe_decimal(sd.value) if sd else Decimal("37700")
+    cgt_rate_basic = Decimal("10") / Decimal("100")
+    cgt_rate_higher = Decimal("20") / Decimal("100")
+    basic_band_available = max(Decimal("0"), basic_threshold - non_savings_income)
+    log_step(f"Using allowance £{q2(cgt_allowance)} for tax year {tax_year_filter if tax_year_filter else 'all'}, non-savings income £{q2(non_savings_income)}, basic band available £{q2(basic_band_available)} (threshold £{q2(basic_threshold)}).")
 
     per_sale_snapshots = []
     all_fragments = []
@@ -329,10 +342,12 @@ def recalc_all(explain=False, tax_year_filter=None):
         log_step(f"Process sale {s.id} date {s.date} shares {safe_decimal(s.shares_sold)}", s.id)
         remaining = safe_decimal(s.shares_sold)
         rate_for_sale = safe_decimal(s.exchange_rate) if s.exchange_rate else get_rate_for_date(s.date, rates)
+        incidental_sale = safe_decimal(s.incidental_costs_gbp or 0)
         if rate_for_sale == Decimal("1") and not rates and not s.exchange_rate:
             log_step("No year-level FX configured; using 1.0", s.id)
         fragments = []
         changed = {}
+        print(f"DEBUG: Processing sale {s.id}, remaining={remaining}, rate={rate_for_sale}, incidental={incidental_sale}, lots before match: {[(l['entry'], l['remaining']) for l in lots if l['remaining'] > 0]}")
 
         for lot in lots:
             if remaining <= 0: break
@@ -357,6 +372,20 @@ def recalc_all(explain=False, tax_year_filter=None):
                     changed[lot["entry"]] = {"matching": "30-day", "before": float(before), "after": float(after), "delta": float(after - before)}
                     fragments.append(("30-day", lot, take))
                     remaining -= take
+
+        if remaining > 0:
+            window_end = s.date + timedelta(days=30)
+            for lot in lots:
+                if remaining <= 0: break
+                if lot["date"] > s.date and lot["date"] <= window_end and lot["remaining"] > 0:
+                    before = safe_decimal(lot["remaining"])
+                    take = min(lot["remaining"], remaining)
+                    lot["remaining"] -= take
+                    after = safe_decimal(lot["remaining"])
+                    changed[lot["entry"]] = {"matching": "30-day forward", "before": float(before), "after": float(after), "delta": float(after - before)}
+                    fragments.append(("30-day forward", lot, take))
+                    remaining -= take
+                    log_step(f"30-day forward match from {lot['entry']} {take} shares", s.id)
 
         if remaining > 0:
             # Section 104 pooling: compute average from all prior remaining lots
@@ -407,21 +436,59 @@ def recalc_all(explain=False, tax_year_filter=None):
             per_sale_snapshots.append({"sale": {"id": s.id, "date": s.date.isoformat(), "shares": float(s.shares_sold)}, "changed": changed, "pool_after": pool_after, "error": True})
             continue
 
+        # Build raw fragments without db add
+        raw_fragments = []
         frag_index = 0
         for mtype, lot, qty in fragments:
             frag_index += 1
             struct = build_fragment_detail_struct(s.sale_price_usd, lot, qty, rate_for_sale, frag_index)
+            struct["inputs"] = {"sale_price_usd": str(s.sale_price_usd), "sale_rate_used": str(rate_for_sale), "lot": {"entry": lot["entry"], "date": str(lot["date"]), "source": lot["source"], "usd_total": str(lot.get("usd_total")), "rate_used": str(lot.get("rate_used")), "paye": str(lot.get("paye"))}}
             proceeds_total = Decimal(struct["numeric_trace"]["proceeds_total_gbp"])
             cost_total = Decimal(struct["numeric_trace"]["cost_total_gbp"])
             gain = Decimal(struct["numeric_trace"]["gain_gbp"])
-            dr = DisposalResult(sale_date=s.date, sale_input_id=s.id, matched_date=lot["date"], matching_type=mtype,
-                                matched_shares=qty, avg_cost_gbp=safe_decimal(lot["avg_cost"]), proceeds_gbp=proceeds_total,
-                                cost_basis_gbp=cost_total, gain_gbp=gain, cgt_due_gbp=Decimal("0"),
-                                calculation_json=json.dumps({"inputs": {"sale_price_usd": str(s.sale_price_usd), "sale_rate_used": str(rate_for_sale), "lot": {"entry": lot["entry"], "date": str(lot["date"]), "source": lot["source"], "usd_total": str(lot.get("usd_total")), "rate_used": str(lot.get("rate_used")), "paye": str(lot.get("paye"))}}, "equations": struct["equations"], "numeric_trace": struct["numeric_trace"]}))
-            db.session.add(dr); db.session.commit()
-            cd = CalculationDetail(disposal_id=dr.id, sale_input_id=s.id, equations="\n".join(struct["equations"]), explanation=f"Fragment {frag_index} matched {qty} from {lot['entry']}")
-            db.session.add(cd); db.session.commit()
-            all_fragments.append(dr)
+            print(f"DEBUG: Raw Fragment {frag_index} for sale {s.id}: type={mtype}, qty={qty}, proceeds={proceeds_total}, cost={cost_total}, gain={gain}")
+            raw_fragments.append((mtype, lot, qty, struct, proceeds_total, cost_total, gain, frag_index))
+
+        # Apply incidental costs to proceeds
+        if incidental_sale > 0 and raw_fragments:
+            total_gross_proceeds = sum(f[4] for f in raw_fragments)
+            if total_gross_proceeds > 0:
+                net_proceeds = total_gross_proceeds - incidental_sale
+                pro_rata = net_proceeds / total_gross_proceeds
+                log_step(f"Applied incidental costs £{q2(incidental_sale)} to sale {s.id} (pro-rata {q2(pro_rata * 100)}%)", s.id)
+                for i, (mtype, lot, qty, struct, gross_proceeds, cost_total, raw_gain, frag_index) in enumerate(raw_fragments):
+                    adjusted_proceeds = q2(gross_proceeds * pro_rata)
+                    adjusted_gain = q2(adjusted_proceeds - cost_total)
+                    # Update equations
+                    struct["equations"][1] = f"Adjusted total proceeds = {q2(gross_proceeds)} × {q2(pro_rata)} (after £{q2(incidental_sale)} incidental) = {adjusted_proceeds}"
+                    struct["numeric_trace"]["proceeds_total_gbp"] = str(adjusted_proceeds)
+                    struct["numeric_trace"]["gain_gbp"] = str(adjusted_gain)
+                    # Add incidental to inputs
+                    struct["inputs"]["incidental_sale"] = str(incidental_sale)
+                    dr = DisposalResult(sale_date=s.date, sale_input_id=s.id, matched_date=lot["date"], matching_type=mtype,
+                                        matched_shares=qty, avg_cost_gbp=safe_decimal(lot["avg_cost"]), proceeds_gbp=adjusted_proceeds,
+                                        cost_basis_gbp=cost_total, gain_gbp=adjusted_gain, cgt_due_gbp=Decimal("0"),
+                                        calculation_json=json.dumps({"inputs": struct["inputs"], "equations": struct["equations"], "numeric_trace": struct["numeric_trace"]}))
+                    db.session.add(dr)
+                    db.session.commit()
+                    cd = CalculationDetail(disposal_id=dr.id, sale_input_id=s.id, equations="\n".join(struct["equations"]), explanation=f"Fragment {frag_index} matched {qty} shares from {lot['entry']} ({mtype}), adjusted for incidental costs")
+                    db.session.add(cd)
+                    db.session.commit()
+                    all_fragments.append(dr)
+            else:
+                log_step(f"No proceeds to adjust for incidental £{q2(incidental_sale)} on sale {s.id}", s.id)
+        else:
+            for i, (mtype, lot, qty, struct, proceeds_total, cost_total, gain, frag_index) in enumerate(raw_fragments):
+                dr = DisposalResult(sale_date=s.date, sale_input_id=s.id, matched_date=lot["date"], matching_type=mtype,
+                                    matched_shares=qty, avg_cost_gbp=safe_decimal(lot["avg_cost"]), proceeds_gbp=proceeds_total,
+                                    cost_basis_gbp=cost_total, gain_gbp=gain, cgt_due_gbp=Decimal("0"),
+                                    calculation_json=json.dumps({"inputs": struct["inputs"], "equations": struct["equations"], "numeric_trace": struct["numeric_trace"]}))
+                db.session.add(dr)
+                db.session.commit()
+                cd = CalculationDetail(disposal_id=dr.id, sale_input_id=s.id, equations="\n".join(struct["equations"]), explanation=f"Fragment {frag_index} matched {qty} shares from {lot['entry']} ({mtype})")
+                db.session.add(cd)
+                db.session.commit()
+                all_fragments.append(dr)
 
         pool_after = [{"entry": lot["entry"], "date": lot["date"].isoformat(), "source": lot["source"], "remaining": float(lot["remaining"]), "per_share_cost": float(q2(lot["avg_cost"])), "tooltip": lot.get("tooltip","")} for lot in lots]
         per_sale_snapshots.append({"sale": {"id": s.id, "date": s.date.isoformat(), "shares": float(s.shares_sold)}, "changed": changed, "pool_after": pool_after, "error": False})
@@ -451,18 +518,55 @@ def recalc_all(explain=False, tax_year_filter=None):
     if tax_year_filter is not None and not errors_present:
         tax_start = date(tax_year_filter,4,6); tax_end = date(tax_year_filter+1,4,5)
         disposals = DisposalResult.query.filter(DisposalResult.sale_date >= tax_start, DisposalResult.sale_date <= tax_end).all()
-        pos = sum([safe_decimal(d.gain_gbp) for d in disposals if safe_decimal(d.gain_gbp) > 0])
-        neg = sum([abs(safe_decimal(d.gain_gbp)) for d in disposals if safe_decimal(d.gain_gbp) < 0])
+        print(f"DEBUG: {len(disposals)} disposals for tax year {tax_year_filter}: {[ (d.sale_input_id, d.gain_gbp, type(d.gain_gbp)) for d in disposals ]}")
+        gains = [safe_decimal(d.gain_gbp) for d in disposals if safe_decimal(d.gain_gbp) > 0]
+        losses = [safe_decimal(d.gain_gbp) for d in disposals if safe_decimal(d.gain_gbp) < 0]
+        pos = sum(gains)
+        neg = sum([abs(l) for l in losses])
+        print(f"DEBUG: pos={pos} (type {type(pos)}), neg={neg} (type {type(neg)})")
         net_gain = pos - neg
+        excess_current_loss = max(Decimal("0"), neg - pos)
         if net_gain < 0: net_gain = Decimal("0")
-        sa = Setting.query.get("CGT_Allowance"); sb = Setting.query.get("CGT_Rate")
+
+        if excess_current_loss > 0 and tax_year_filter is not None:
+            future_year = tax_year_filter + 1
+            loss = CarryForwardLoss.query.filter_by(tax_year=future_year).first()
+            if loss:
+                loss.amount += excess_current_loss
+            else:
+                loss = CarryForwardLoss(tax_year=future_year, amount=excess_current_loss, notes=f"Excess loss from {tax_year_filter}")
+                db.session.add(loss)
+        
+        # Apply carry-forward losses from previous years
+        carry_forward_losses = CarryForwardLoss.query.filter(CarryForwardLoss.tax_year < tax_year_filter).all()
+        total_carry_forward_loss = sum(safe_decimal(loss.amount) for loss in carry_forward_losses)
+        
+        # Subtract carry-forward losses from net gain before applying allowance
+        net_gain_after_losses = max(Decimal("0"), net_gain - total_carry_forward_loss)
+        
+        sa = Setting.query.get("CGT_Allowance"); sc = Setting.query.get("NonSavingsIncome"); sd = Setting.query.get("BasicBandThreshold")
         cgt_allowance = safe_decimal(sa.value) if sa and safe_decimal(sa.value) > 0 and tax_year_filter <= 2024 else get_aea(tax_year_filter)
-        cgt_rate_pct = safe_decimal(sb.value) if sb else Decimal("20")
-        cgt_rate = cgt_rate_pct / Decimal("100")
-        taxable = net_gain - cgt_allowance
-        if taxable < 0: taxable = Decimal("0")
-        estimated_cgt = q2(taxable * cgt_rate)
-        taxable_summary = {"pos": float(q2(pos)), "neg": float(q2(neg)), "net_gain": float(q2(net_gain)), "taxable": float(q2(taxable)), "estimated_cgt": float(estimated_cgt)}
+        non_savings_income = safe_decimal(sc.value) if sc else Decimal("0")
+        basic_threshold = safe_decimal(sd.value) if sd else Decimal("37700")
+        basic_band_available = max(Decimal("0"), basic_threshold - non_savings_income)
+        taxable_gain = net_gain_after_losses - cgt_allowance
+        if taxable_gain < 0: taxable_gain = Decimal("0")
+        basic_taxable = min(taxable_gain, basic_band_available)
+        higher_taxable = taxable_gain - basic_taxable
+        estimated_cgt = q2(basic_taxable * Decimal("0.10") + higher_taxable * Decimal("0.20"))
+        taxable_summary = {
+            "pos": float(q2(pos)), "neg": float(q2(neg)), "net_gain": float(q2(net_gain)),
+            "cgt_allowance": float(q2(cgt_allowance)),
+            "non_savings_income": float(q2(non_savings_income)),
+            "basic_threshold": float(q2(basic_threshold)),
+            "basic_band_available": float(q2(basic_band_available)),
+            "total_carry_forward_loss": float(q2(total_carry_forward_loss)),
+            "net_gain_after_losses": float(q2(net_gain_after_losses)),
+            "taxable_gain": float(q2(taxable_gain)),
+            "basic_taxable": float(q2(basic_taxable)),
+            "higher_taxable": float(q2(higher_taxable)),
+            "estimated_cgt": float(estimated_cgt)
+        }
         if pos > 0 and estimated_cgt > 0:
             for d in disposals:
                 g = safe_decimal(d.gain_gbp)
@@ -472,6 +576,10 @@ def recalc_all(explain=False, tax_year_filter=None):
                     d.cgt_due_gbp = alloc
                     db.session.add(d)
             db.session.commit()
+
+            # Commit the new carry-forward loss if added
+            if excess_current_loss > 0 and tax_year_filter is not None:
+                db.session.commit()
 
     return {"per_sale_snapshots": per_sale_snapshots, "errors_present": errors_present, "taxable_summary": taxable_summary}
 
@@ -963,13 +1071,22 @@ def delete_vesting(id):
 def add_espp():
     d = to_date(request.form.get("date"))
     shares = safe_decimal(request.form.get("shares_retained"))
-    purchase = request.form.get("purchase_price_usd")
-    market = request.form.get("market_price_usd")
+    purchase_str = request.form.get("purchase_price_usd")
+    market_str = request.form.get("market_price_usd")
     paye = request.form.get("paye_tax_gbp")
     exch = request.form.get("exchange_rate")
     discount_taxed = True if request.form.get("discount_taxed")=="on" else False
     if not d or shares <= 0: flash("Invalid ESPP","danger"); return redirect(url_for("index_full"))
-    p = ESPPPurchase(date=d, shares_retained=shares, purchase_price_usd=safe_decimal(purchase) if purchase else None, market_price_usd=safe_decimal(market) if market else None, paye_tax_gbp=safe_decimal(paye) if paye else None, exchange_rate=safe_decimal(exch) if exch else None, discount_taxed_paye=discount_taxed)
+    purchase = safe_decimal(purchase_str) if purchase_str else None
+    market = safe_decimal(market_str) if market_str else None
+    discount = Decimal("0")
+    qualifying = True
+    if market and purchase and market > 0 and purchase < market:
+        discount = ((market - purchase) / market) * 100
+        qualifying = discount <= 15
+        if not qualifying:
+            flash(f"Warning: ESPP discount {q2(discount)}% > 15%. May not qualify for relief. Full market value treated as income.", "warning")
+    p = ESPPPurchase(date=d, shares_retained=shares, purchase_price_usd=purchase, market_price_usd=market, discount=discount, paye_tax_gbp=safe_decimal(paye) if paye else None, exchange_rate=safe_decimal(exch) if exch else None, discount_taxed_paye=discount_taxed, qualifying=qualifying)
     db.session.add(p); db.session.commit(); flash("ESPP added","success"); return redirect(url_for("index_full"))
 
 @app.route("/edit_espp/<int:id>", methods=["GET","POST"])
@@ -977,8 +1094,21 @@ def edit_espp(id):
     p = ESPPPurchase.query.get_or_404(id)
     if request.method=="POST":
         p.date = to_date(request.form.get("date")); p.shares_retained = safe_decimal(request.form.get("shares_retained"))
-        p.purchase_price_usd = safe_decimal(request.form.get("purchase_price_usd")) if request.form.get("purchase_price_usd") else None
-        p.market_price_usd = safe_decimal(request.form.get("market_price_usd")) if request.form.get("market_price_usd") else None
+        purchase_str = request.form.get("purchase_price_usd")
+        market_str = request.form.get("market_price_usd")
+        purchase = safe_decimal(purchase_str) if purchase_str else None
+        market = safe_decimal(market_str) if market_str else None
+        discount = Decimal("0")
+        qualifying = True
+        if market and purchase and market > 0 and purchase < market:
+            discount = ((market - purchase) / market) * 100
+            qualifying = discount <= 15
+            if not qualifying:
+                flash(f"Warning: ESPP discount {q2(discount)}% > 15%. May not qualify for relief. Full market value treated as income.", "warning")
+        p.purchase_price_usd = purchase
+        p.market_price_usd = market
+        p.discount = discount
+        p.qualifying = qualifying
         p.paye_tax_gbp = safe_decimal(request.form.get("paye_tax_gbp")) if request.form.get("paye_tax_gbp") else None
         p.exchange_rate = safe_decimal(request.form.get("exchange_rate")) if request.form.get("exchange_rate") else None
         p.discount_taxed_paye = True if request.form.get("discount_taxed")=="on" else False
@@ -1205,6 +1335,21 @@ def api_snapshot(year):
         "snapshot_json": snapshot.snapshot_json
     })
 
+@app.route("/api/settings", methods=["POST"])
+def api_update_settings():
+    key = request.json.get("key")
+    value = request.json.get("value")
+    if not key or value is None:
+        return jsonify({"error": "Missing key or value"}), 400
+    setting = Setting.query.get(key)
+    if setting:
+        setting.value = str(value)
+    else:
+        setting = Setting(key=key, value=str(value))
+        db.session.add(setting)
+    db.session.commit()
+    return jsonify({"success": True, "key": key, "value": value})
+
 @app.route("/api/summary/<int:year>")
 def api_summary(year):
     tax_start = date(year, 4, 6)
@@ -1223,29 +1368,266 @@ def api_summary(year):
     if net_gain < 0:
         net_gain = Decimal("0")
     
+    # Apply carry-forward losses from previous years
+    carry_forward_losses = CarryForwardLoss.query.filter(CarryForwardLoss.tax_year < year).all()
+    total_carry_forward_loss = sum(safe_decimal(loss.amount) for loss in carry_forward_losses)
+    
+    # Subtract carry-forward losses from net gain before applying allowance
+    net_gain_after_losses = max(Decimal("0"), net_gain - total_carry_forward_loss)
+    
     sa = Setting.query.get("CGT_Allowance")
-    sb = Setting.query.get("CGT_Rate")
+    sc = Setting.query.get("NonSavingsIncome")
+    sd = Setting.query.get("BasicBandThreshold")
     cgt_allowance = safe_decimal(sa.value) if sa and safe_decimal(sa.value) > 0 and year <= 2024 else get_aea(year)
-    cgt_rate_pct = safe_decimal(sb.value) if sb else Decimal("20")
-    cgt_rate = cgt_rate_pct / Decimal("100")
-    taxable = net_gain - cgt_allowance
-    if taxable < 0:
-        taxable = Decimal("0")
-    estimated_cgt = q2(taxable * cgt_rate)
+    non_savings_income = safe_decimal(sc.value) if sc else Decimal("0")
+    basic_threshold = safe_decimal(sd.value) if sd else Decimal("37700")
+    basic_band_available = max(Decimal("0"), basic_threshold - non_savings_income)
+    taxable_gain = net_gain_after_losses - cgt_allowance
+    if taxable_gain < 0:
+        taxable_gain = Decimal("0")
+    basic_taxable = min(taxable_gain, basic_band_available)
+    higher_taxable = taxable_gain - basic_taxable
+    estimated_cgt = q2(basic_taxable * Decimal("0.10") + higher_taxable * Decimal("0.20"))
     
     return jsonify({
         "tax_year_start": tax_start.isoformat(),
         "tax_year_end": tax_end.isoformat(),
         "cgt_allowance_gbp": float(q2(cgt_allowance)),
-        "cgt_rate_percent": float(q2(cgt_rate_pct)),
+        "carry_forward_loss_gbp": float(q2(total_carry_forward_loss)),
+        "net_gain_after_losses": float(q2(net_gain_after_losses)),
+        "non_savings_income": float(q2(non_savings_income)),
+        "basic_threshold": float(q2(basic_threshold)),
+        "basic_band_available": float(q2(basic_band_available)),
         "total_disposals": len(disposals),
         "total_proceeds": float(q2(total_proceeds)),
         "total_cost": float(q2(total_cost)),
         "total_gain": float(q2(total_gain)),
         "net_gain": float(q2(net_gain)),
-        "taxable_after_allowance": float(q2(taxable)),
+        "taxable_after_allowance": float(q2(taxable_gain)),
+        "basic_taxable_gain": float(q2(basic_taxable)),
+        "higher_taxable_gain": float(q2(higher_taxable)),
         "estimated_cgt": float(q2(estimated_cgt))
     })
+
+# Helper to serialize model to dict
+def model_to_dict(model):
+    if isinstance(model, Vesting):
+        return {
+            'id': model.id,
+            'date': model.date.isoformat() if model.date else None,
+            'shares_vested': float(model.shares_vested) if model.shares_vested else None,
+            'price_usd': float(model.price_usd) if model.price_usd else None,
+            'total_usd': float(model.total_usd) if model.total_usd else None,
+            'exchange_rate': float(model.exchange_rate) if model.exchange_rate else None,
+            'total_gbp': float(model.total_gbp) if model.total_gbp else None,
+            'tax_paid_gbp': float(model.tax_paid_gbp) if model.tax_paid_gbp else None,
+            'incidental_costs_gbp': float(model.incidental_costs_gbp) if model.incidental_costs_gbp else None,
+            'shares_sold': float(model.shares_sold) if model.shares_sold else None,
+            'net_shares': float(model.net_shares) if model.net_shares else None,
+        }
+    elif isinstance(model, ESPPPurchase):
+        return {
+            'id': model.id,
+            'date': model.date.isoformat() if model.date else None,
+            'shares_retained': float(model.shares_retained) if model.shares_retained else None,
+            'purchase_price_usd': float(model.purchase_price_usd) if model.purchase_price_usd else None,
+            'market_price_usd': float(model.market_price_usd) if model.market_price_usd else None,
+            'discount': float(model.discount) if model.discount else None,
+            'exchange_rate': float(model.exchange_rate) if model.exchange_rate else None,
+            'total_gbp': float(model.total_gbp) if model.total_gbp else None,
+            'discount_taxed_paye': model.discount_taxed_paye,
+            'paye_tax_gbp': float(model.paye_tax_gbp) if model.paye_tax_gbp else None,
+            'qualifying': model.qualifying,
+            'incidental_costs_gbp': float(model.incidental_costs_gbp) if model.incidental_costs_gbp else None,
+            'notes': model.notes,
+        }
+    elif isinstance(model, SaleInput):
+        return {
+            'id': model.id,
+            'date': model.date.isoformat() if model.date else None,
+            'shares_sold': float(model.shares_sold) if model.shares_sold else None,
+            'sale_price_usd': float(model.sale_price_usd) if model.sale_price_usd else None,
+            'exchange_rate': float(model.exchange_rate) if model.exchange_rate else None,
+            'incidental_costs_gbp': float(model.incidental_costs_gbp) if model.incidental_costs_gbp else None,
+        }
+    return {}
+
+# ---------- CRUD APIs for Vestings ----------
+@app.route('/api/vestings', methods=['POST'])
+def create_vesting():
+    data = request.json
+    if not data:
+        return jsonify({'error': 'No data provided'}), 400
+    try:
+        v = Vesting(
+            date=to_date(data.get('date')),
+            shares_vested=safe_decimal(data.get('shares_vested')),
+            price_usd=safe_decimal(data.get('price_usd')),
+            shares_sold=safe_decimal(data.get('shares_sold', 0)),
+            total_usd=safe_decimal(data.get('total_usd')),
+            exchange_rate=safe_decimal(data.get('exchange_rate')),
+            total_gbp=safe_decimal(data.get('total_gbp')),
+            tax_paid_gbp=safe_decimal(data.get('tax_paid_gbp')),
+            incidental_costs_gbp=safe_decimal(data.get('incidental_costs_gbp', 0)),
+            net_shares=safe_decimal(data.get('net_shares'))
+        )
+        db.session.add(v)
+        db.session.commit()
+        return jsonify(model_to_dict(v)), 201
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({'error': str(e)}), 400
+
+@app.route('/api/vestings', methods=['GET'])
+def get_vestings():
+    vestings = Vesting.query.order_by(Vesting.date.asc()).all()
+    return jsonify([model_to_dict(v) for v in vestings])
+
+@app.route('/api/vestings/<int:id>', methods=['PUT'])
+def update_vesting(id):
+    v = Vesting.query.get_or_404(id)
+    data = request.json
+    if not data:
+        return jsonify({'error': 'No data provided'}), 400
+    try:
+        v.date = to_date(data.get('date', v.date))
+        v.shares_vested = safe_decimal(data.get('shares_vested', v.shares_vested))
+        v.price_usd = safe_decimal(data.get('price_usd', v.price_usd))
+        v.shares_sold = safe_decimal(data.get('shares_sold', v.shares_sold))
+        v.total_usd = safe_decimal(data.get('total_usd', v.total_usd))
+        v.exchange_rate = safe_decimal(data.get('exchange_rate', v.exchange_rate))
+        v.total_gbp = safe_decimal(data.get('total_gbp', v.total_gbp))
+        v.tax_paid_gbp = safe_decimal(data.get('tax_paid_gbp', v.tax_paid_gbp))
+        v.incidental_costs_gbp = safe_decimal(data.get('incidental_costs_gbp', v.incidental_costs_gbp))
+        v.net_shares = safe_decimal(data.get('net_shares', v.net_shares))
+        db.session.commit()
+        return jsonify(model_to_dict(v))
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({'error': str(e)}), 400
+
+@app.route('/api/vestings/<int:id>', methods=['DELETE'])
+def api_delete_vesting(id):
+    v = Vesting.query.get_or_404(id)
+    db.session.delete(v)
+    db.session.commit()
+    return jsonify({'message': 'Vesting deleted'})
+
+# ---------- CRUD APIs for ESPP ----------
+@app.route('/api/espp', methods=['POST'])
+def create_espp():
+    data = request.json
+    if not data:
+        return jsonify({'error': 'No data provided'}), 400
+    try:
+        p = ESPPPurchase(
+            date=to_date(data.get('date')),
+            shares_retained=safe_decimal(data.get('shares_retained')),
+            purchase_price_usd=safe_decimal(data.get('purchase_price_usd')),
+            market_price_usd=safe_decimal(data.get('market_price_usd')),
+            discount=safe_decimal(data.get('discount')),
+            exchange_rate=safe_decimal(data.get('exchange_rate')),
+            total_gbp=safe_decimal(data.get('total_gbp')),
+            discount_taxed_paye=data.get('discount_taxed_paye', True),
+            paye_tax_gbp=safe_decimal(data.get('paye_tax_gbp')),
+            qualifying=data.get('qualifying', True),
+            incidental_costs_gbp=safe_decimal(data.get('incidental_costs_gbp', 0)),
+            notes=data.get('notes', '')
+        )
+        db.session.add(p)
+        db.session.commit()
+        return jsonify(model_to_dict(p)), 201
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({'error': str(e)}), 400
+
+@app.route('/api/espp', methods=['GET'])
+def get_espp():
+    espps = ESPPPurchase.query.order_by(ESPPPurchase.date.asc()).all()
+    return jsonify([model_to_dict(e) for e in espps])
+
+@app.route('/api/espp/<int:id>', methods=['PUT'])
+def update_espp(id):
+    p = ESPPPurchase.query.get_or_404(id)
+    data = request.json
+    if not data:
+        return jsonify({'error': 'No data provided'}), 400
+    try:
+        p.date = to_date(data.get('date', p.date))
+        p.shares_retained = safe_decimal(data.get('shares_retained', p.shares_retained))
+        p.purchase_price_usd = safe_decimal(data.get('purchase_price_usd', p.purchase_price_usd))
+        p.market_price_usd = safe_decimal(data.get('market_price_usd', p.market_price_usd))
+        p.discount = safe_decimal(data.get('discount', p.discount))
+        p.exchange_rate = safe_decimal(data.get('exchange_rate', p.exchange_rate))
+        p.total_gbp = safe_decimal(data.get('total_gbp', p.total_gbp))
+        p.discount_taxed_paye = data.get('discount_taxed_paye', p.discount_taxed_paye)
+        p.paye_tax_gbp = safe_decimal(data.get('paye_tax_gbp', p.paye_tax_gbp))
+        p.qualifying = data.get('qualifying', p.qualifying)
+        p.incidental_costs_gbp = safe_decimal(data.get('incidental_costs_gbp', p.incidental_costs_gbp))
+        p.notes = data.get('notes', p.notes)
+        db.session.commit()
+        return jsonify(model_to_dict(p))
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({'error': str(e)}), 400
+
+@app.route('/api/espp/<int:id>', methods=['DELETE'])
+def api_delete_espp(id):
+    p = ESPPPurchase.query.get_or_404(id)
+    db.session.delete(p)
+    db.session.commit()
+    return jsonify({'message': 'ESPP deleted'})
+
+# ---------- CRUD APIs for Sales ----------
+@app.route('/api/sales', methods=['POST'])
+def create_sale():
+    data = request.json
+    if not data:
+        return jsonify({'error': 'No data provided'}), 400
+    try:
+        s = SaleInput(
+            date=to_date(data.get('date')),
+            shares_sold=safe_decimal(data.get('shares_sold')),
+            sale_price_usd=safe_decimal(data.get('sale_price_usd')),
+            exchange_rate=safe_decimal(data.get('exchange_rate')),
+            incidental_costs_gbp=safe_decimal(data.get('incidental_costs_gbp', 0))
+        )
+        db.session.add(s)
+        db.session.commit()
+        return jsonify(model_to_dict(s)), 201
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({'error': str(e)}), 400
+
+@app.route('/api/sales', methods=['GET'])
+def get_sales():
+    sales = SaleInput.query.order_by(SaleInput.date.asc()).all()
+    return jsonify([model_to_dict(s) for s in sales])
+
+@app.route('/api/sales/<int:id>', methods=['PUT'])
+def update_sale(id):
+    s = SaleInput.query.get_or_404(id)
+    data = request.json
+    if not data:
+        return jsonify({'error': 'No data provided'}), 400
+    try:
+        s.date = to_date(data.get('date', s.date))
+        s.shares_sold = safe_decimal(data.get('shares_sold', s.shares_sold))
+        s.sale_price_usd = safe_decimal(data.get('sale_price_usd', s.sale_price_usd))
+        s.exchange_rate = safe_decimal(data.get('exchange_rate', s.exchange_rate))
+        s.incidental_costs_gbp = safe_decimal(data.get('incidental_costs_gbp', s.incidental_costs_gbp))
+        db.session.commit()
+        return jsonify(model_to_dict(s))
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({'error': str(e)}), 400
+
+@app.route('/api/sales/<int:id>', methods=['DELETE'])
+def api_delete_sale(id):
+    s = SaleInput.query.get_or_404(id)
+    db.session.delete(s)
+    db.session.commit()
+    return jsonify({'message': 'Sale deleted'})
 
 # ---------- Migration helper and bootstrap ----------
 def ensure_db_schema():
@@ -1260,6 +1642,12 @@ def ensure_db_schema():
         except Exception:
             return False
     try:
+        c.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='vesting'")
+        if c.fetchone():
+            if not has_col("vesting", "incidental_costs_gbp"): c.execute("ALTER TABLE vesting ADD COLUMN incidental_costs_gbp NUMERIC DEFAULT 0")
+    except Exception:
+        pass
+    try:
         c.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='espp'")
         if c.fetchone():
             if not has_col("espp", "shares_retained"): c.execute("ALTER TABLE espp ADD COLUMN shares_retained NUMERIC")
@@ -1268,12 +1656,15 @@ def ensure_db_schema():
             if not has_col("espp", "discount_taxed_paye"): c.execute("ALTER TABLE espp ADD COLUMN discount_taxed_paye BOOLEAN")
             if not has_col("espp", "paye_tax_gbp"): c.execute("ALTER TABLE espp ADD COLUMN paye_tax_gbp NUMERIC")
             if not has_col("espp", "exchange_rate"): c.execute("ALTER TABLE espp ADD COLUMN exchange_rate NUMERIC")
+            if not has_col("espp", "incidental_costs_gbp"): c.execute("ALTER TABLE espp ADD COLUMN incidental_costs_gbp NUMERIC DEFAULT 0")
+            if not has_col("espp", "qualifying"): c.execute("ALTER TABLE espp ADD COLUMN qualifying BOOLEAN DEFAULT 1")
     except Exception:
         pass
     try:
         c.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='sales_in'")
         if c.fetchone():
             if not has_col("sales_in", "exchange_rate"): c.execute("ALTER TABLE sales_in ADD COLUMN exchange_rate NUMERIC")
+            if not has_col("sales_in", "incidental_costs_gbp"): c.execute("ALTER TABLE sales_in ADD COLUMN incidental_costs_gbp NUMERIC DEFAULT 0")
     except Exception:
         pass
     try:
@@ -1301,6 +1692,8 @@ def bootstrap():
         db.create_all()
         if not Setting.query.get("CGT_Allowance"): db.session.add(Setting(key="CGT_Allowance", value="0"))  # 0 means use dynamic
         if not Setting.query.get("CGT_Rate"): db.session.add(Setting(key="CGT_Rate", value="20"))
+        if not Setting.query.get("NonSavingsIncome"): db.session.add(Setting(key="NonSavingsIncome", value="0"))
+        if not Setting.query.get("BasicBandThreshold"): db.session.add(Setting(key="BasicBandThreshold", value="37700"))
         db.session.commit()
 
 if __name__ == "__main__":
