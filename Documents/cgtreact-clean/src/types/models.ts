@@ -101,6 +101,8 @@ export interface BackendCGTSummary {
   total_proceeds: number;
   total_cost: number;
   total_gain: number;
+  pos: number;
+  neg: number;
   net_gain: number;
   taxable_after_allowance: number;
   basic_taxable_gain: number;
@@ -115,17 +117,41 @@ export interface CGTSummary {
   cgt_allowance_gbp: number;
   carry_forward_loss_gbp: number;
   net_gain_after_losses: number;
-  allowance_used_gbp: number;
-  taxable_income: number;
-  basic_limit: number;
-  basic_gain: number;
-  higher_gain: number;
-  effective_rate_percent: number;
+  non_savings_income: number;
+  basic_threshold: number;
+  basic_band_available: number;
   total_disposals: number;
   total_proceeds: number;
   total_cost: number;
   total_gain: number;
+  pos: number;
+  neg: number;
   net_gain: number;
   taxable_after_allowance: number;
+  basic_taxable_gain: number;
+  higher_taxable_gain: number;
   estimated_cgt: number;
+}
+
+export interface SA108Export {
+  tax_year: number;
+  tax_year_start: string;
+  tax_year_end: string;
+  total_proceeds: number;
+  total_costs: number;
+  total_gains: number;
+  total_losses: number;
+  net_gain: number;
+  allowable_loss: number;
+  carry_forward_loss_used: number;
+  net_gain_after_losses: number;
+  cgt_allowance_used: number;
+  chargeable_gain: number;
+  disposals: Array<{
+    date: string;
+    description: string;
+    proceeds: number;
+    cost: number;
+    gain_loss: number;
+  }>;
 }

@@ -267,12 +267,36 @@ def build_fragment_detail_struct(sale_price_usd: Decimal, lot, qty, rate_for_sal
     return {"equations": equations, "numeric_trace": numeric_trace}
 
 # ---------- Core matching & snapshot logic (enhanced) ----------
-def recalc_all(explain=False, tax_year_filter=None):
-    DisposalResult.query.delete()
-    PoolSnapshot.query.delete()
-    CalculationStep.query.delete()
-    CalculationDetail.query.delete()
-    db.session.commit()
+def recalc_all(explain=False, tax_year_filter=None, sale_filter=None):
+    """
+    sale_filter: Optional list of sale_input_ids or date_from (str 'YYYY-MM-DD') to recompute only affected sales.
+    If None, full recalc (default).
+    """
+    if sale_filter is None:
+        # Full recalc: clear all
+        DisposalResult.query.delete()
+        PoolSnapshot.query.delete()
+        CalculationStep.query.delete()
+        CalculationDetail.query.delete()
+        db.session.commit()
+        full_mode = True
+    else:
+        full_mode = False
+        # Partial: only delete affected results
+        if isinstance(sale_filter, list):
+            # Filter by sale IDs
+            affected_sales = SaleInput.query.filter(SaleInput.id.in_(sale_filter)).all()
+            affected_ids = [s.id for s in affected_sales]
+            DisposalResult.query.filter(DisposalResult.sale_input_id.in_(affected_ids)).delete()
+        elif isinstance(sale_filter, str):
+            # Filter by date_from: delete results for sales on/after date
+            date_from = to_date(sale_filter)
+            affected_sales = SaleInput.query.filter(SaleInput.date >= date_from).all()
+            affected_ids = [s.id for s in affected_sales]
+            DisposalResult.query.filter(DisposalResult.sale_input_id.in_(affected_ids)).delete()
+        else:
+            raise ValueError("sale_filter must be list of IDs or date string")
+        db.session.commit()
 
     rates = load_rates_sorted()
     lots = []
@@ -326,7 +350,7 @@ def recalc_all(explain=False, tax_year_filter=None):
     log_step(f"Total lots built: {len(lots)}")
 
     sa = Setting.query.get("CGT_Allowance"); sb = Setting.query.get("CGT_Rate"); sc = Setting.query.get("NonSavingsIncome"); sd = Setting.query.get("BasicBandThreshold")
-    cgt_allowance = safe_decimal(sa.value) if sa and safe_decimal(sa.value) > 0 and (tax_year_filter is None or tax_year_filter <= 2024) else get_aea(tax_year_filter)
+    cgt_allowance = safe_decimal(sa.value) if sa and safe_decimal(sa.value) > 0 and (tax_year_filter is None or tax_year_filter < 2024) else get_aea(tax_year_filter)
     non_savings_income = safe_decimal(sc.value) if sc else Decimal("0")
     basic_threshold = safe_decimal(sd.value) if sd else Decimal("37700")
     cgt_rate_basic = Decimal("10") / Decimal("100")
@@ -337,7 +361,18 @@ def recalc_all(explain=False, tax_year_filter=None):
     per_sale_snapshots = []
     all_fragments = []
 
-    sales_all = SaleInput.query.order_by(SaleInput.date.asc(), SaleInput.id.asc()).all()
+    # Filter sales if partial
+    if full_mode:
+        sales_all = SaleInput.query.order_by(SaleInput.date.asc(), SaleInput.id.asc()).all()
+    else:
+        if isinstance(sale_filter, list):
+            sales_all = SaleInput.query.filter(SaleInput.id.in_(sale_filter)).order_by(SaleInput.date.asc(), SaleInput.id.asc()).all()
+        elif isinstance(sale_filter, str):
+            date_from = to_date(sale_filter)
+            sales_all = SaleInput.query.filter(SaleInput.date >= date_from).order_by(SaleInput.date.asc(), SaleInput.id.asc()).all()
+        else:
+            sales_all = []  # Should not happen
+
     for s in sales_all:
         log_step(f"Process sale {s.id} date {s.date} shares {safe_decimal(s.shares_sold)}", s.id)
         remaining = safe_decimal(s.shares_sold)
@@ -492,27 +527,34 @@ def recalc_all(explain=False, tax_year_filter=None):
 
         pool_after = [{"entry": lot["entry"], "date": lot["date"].isoformat(), "source": lot["source"], "remaining": float(lot["remaining"]), "per_share_cost": float(q2(lot["avg_cost"])), "tooltip": lot.get("tooltip","")} for lot in lots]
         per_sale_snapshots.append({"sale": {"id": s.id, "date": s.date.isoformat(), "shares": float(s.shares_sold)}, "changed": changed, "pool_after": pool_after, "error": False})
-
-    snaps_by_ty = {}
-    for snap in per_sale_snapshots:
-        sale_date = datetime.fromisoformat(snap["sale"]["date"]).date()
-        ty = sale_date.year if sale_date >= date(sale_date.year,4,6) else sale_date.year - 1
-        snaps_by_ty.setdefault(ty, []).append(snap)
-
-    for ty, snaps in snaps_by_ty.items():
-        total_shares = sum([safe_decimal(lot["remaining"]) for lot in lots])
-        total_cost = sum([safe_decimal(lot["avg_cost"]) * safe_decimal(lot["remaining"]) for lot in lots])
-        avg_cost = (total_cost / total_shares) if total_shares != 0 else Decimal("0")
-        ps = PoolSnapshot(timestamp=datetime.utcnow(), tax_year=ty, snapshot_json=json.dumps(snaps), total_shares=total_shares, total_cost_gbp=total_cost, avg_cost_gbp=avg_cost)
-        db.session.add(ps)
-
-    total_shares = sum([safe_decimal(lot["remaining"]) for lot in lots])
-    total_cost = sum([safe_decimal(lot["avg_cost"]) * safe_decimal(lot["remaining"]) for lot in lots])
-    avg_cost = (total_cost / total_shares) if total_shares != 0 else Decimal("0")
-    ps_final = PoolSnapshot(timestamp=datetime.utcnow(), tax_year=None, snapshot_json=json.dumps(per_sale_snapshots), total_shares=total_shares, total_cost_gbp=total_cost, avg_cost_gbp=avg_cost)
-    db.session.add(ps_final)
-    db.session.commit()
-    log_step("Stored snapshots and final pool snapshot.")
+    
+    # Only create snapshots if full recalc or if tax_year_filter specified
+    if full_mode or tax_year_filter:
+        snaps_by_ty = {}
+        for snap in per_sale_snapshots:
+            sale_date = datetime.fromisoformat(snap["sale"]["date"]).date()
+            ty = sale_date.year if sale_date >= date(sale_date.year,4,6) else sale_date.year - 1
+            snaps_by_ty.setdefault(ty, []).append(snap)
+    
+        for ty, snaps in snaps_by_ty.items():
+            total_shares = sum([safe_decimal(lot["remaining"]) for lot in lots])
+            total_cost = sum([safe_decimal(lot["avg_cost"]) * safe_decimal(lot["remaining"]) for lot in lots])
+            avg_cost = (total_cost / total_shares) if total_shares != 0 else Decimal("0")
+            ps = PoolSnapshot(timestamp=datetime.utcnow(), tax_year=ty, snapshot_json=json.dumps(snaps), total_shares=total_shares, total_cost_gbp=total_cost, avg_cost_gbp=avg_cost)
+            db.session.add(ps)
+    
+        # Final snapshot only on full
+        if full_mode:
+            total_shares = sum([safe_decimal(lot["remaining"]) for lot in lots])
+            total_cost = sum([safe_decimal(lot["avg_cost"]) * safe_decimal(lot["remaining"]) for lot in lots])
+            avg_cost = (total_cost / total_shares) if total_shares != 0 else Decimal("0")
+            ps_final = PoolSnapshot(timestamp=datetime.utcnow(), tax_year=None, snapshot_json=json.dumps(per_sale_snapshots), total_shares=total_shares, total_cost_gbp=total_cost, avg_cost_gbp=avg_cost)
+            db.session.add(ps_final)
+        db.session.commit()
+        log_step("Stored snapshots and final pool snapshot.")
+    else:
+        db.session.commit()
+        log_step(f"Partial recalc complete for {len(sales_all)} sales. No new snapshots created.")
 
     taxable_summary = None
     if tax_year_filter is not None and not errors_present:
@@ -529,12 +571,12 @@ def recalc_all(explain=False, tax_year_filter=None):
         if net_gain < 0: net_gain = Decimal("0")
 
         if excess_current_loss > 0 and tax_year_filter is not None:
-            future_year = tax_year_filter + 1
-            loss = CarryForwardLoss.query.filter_by(tax_year=future_year).first()
+            loss_year = tax_year_filter
+            loss = CarryForwardLoss.query.filter_by(tax_year=loss_year).first()
             if loss:
                 loss.amount += excess_current_loss
             else:
-                loss = CarryForwardLoss(tax_year=future_year, amount=excess_current_loss, notes=f"Excess loss from {tax_year_filter}")
+                loss = CarryForwardLoss(tax_year=loss_year, amount=excess_current_loss, notes=f"Excess loss from {tax_year_filter}")
                 db.session.add(loss)
         
         # Apply carry-forward losses from previous years
@@ -545,7 +587,7 @@ def recalc_all(explain=False, tax_year_filter=None):
         net_gain_after_losses = max(Decimal("0"), net_gain - total_carry_forward_loss)
         
         sa = Setting.query.get("CGT_Allowance"); sc = Setting.query.get("NonSavingsIncome"); sd = Setting.query.get("BasicBandThreshold")
-        cgt_allowance = safe_decimal(sa.value) if sa and safe_decimal(sa.value) > 0 and tax_year_filter <= 2024 else get_aea(tax_year_filter)
+        cgt_allowance = safe_decimal(sa.value) if sa and safe_decimal(sa.value) > 0 and tax_year_filter < 2024 else get_aea(tax_year_filter)
         non_savings_income = safe_decimal(sc.value) if sc else Decimal("0")
         basic_threshold = safe_decimal(sd.value) if sd else Decimal("37700")
         basic_band_available = max(Decimal("0"), basic_threshold - non_savings_income)
@@ -1048,7 +1090,10 @@ def add_vesting():
     sold = safe_decimal(request.form.get("shares_sold") or "0")
     if not d or shares <= 0: flash("Invalid vesting", "danger"); return redirect(url_for("index_full"))
     v = Vesting(date=d, shares_vested=shares, price_usd=safe_decimal(price) if price else None, shares_sold=sold, net_shares=(shares - sold))
-    db.session.add(v); db.session.commit(); flash("Vesting added","success"); return redirect(url_for("index_full"))
+    db.session.add(v); db.session.commit(); flash("Vesting added","success")
+    # Trigger partial recalc for sales after this date
+    recalc_all(sale_filter=d.isoformat())
+    return redirect(url_for("index_full"))
 
 @app.route("/edit_vesting/<int:id>", methods=["GET","POST"])
 def edit_vesting(id):
@@ -1057,7 +1102,14 @@ def edit_vesting(id):
         v.date = to_date(request.form.get("date")); v.shares_vested = safe_decimal(request.form.get("shares_vested"))
         v.price_usd = safe_decimal(request.form.get("price_usd")) if request.form.get("price_usd") else None
         v.shares_sold = safe_decimal(request.form.get("shares_sold") or "0"); v.net_shares = v.shares_vested - v.shares_sold
-        db.session.add(v); db.session.commit(); flash("Vesting updated","success"); return redirect(url_for("index_full"))
+        old_date = v.date  # Before update, but since date might change, use new date for filter
+        db.session.add(v); db.session.commit(); flash("Vesting updated","success")
+        # Partial recalc from min(old_date, new_date)
+        new_date = v.date
+        recalc_date = min(old_date, new_date).isoformat() if old_date and new_date else None
+        if recalc_date:
+            recalc_all(sale_filter=recalc_date)
+        return redirect(url_for("index_full"))
     return f"<form method='post'><input type='date' name='date' value='{v.date}' required><input type='number' step='0.000001' name='shares_vested' value='{v.shares_vested}' required><input type='number' step='0.000001' name='price_usd' value='{v.price_usd or ''}'><input type='number' step='0.000001' name='shares_sold' value='{v.shares_sold or 0}'><button>Save</button></form>"
 
 @app.route("/delete_vesting/<int:id>")
@@ -1076,35 +1128,50 @@ def add_espp():
     paye = request.form.get("paye_tax_gbp")
     exch = request.form.get("exchange_rate")
     discount_taxed = True if request.form.get("discount_taxed")=="on" else False
-    if not d or shares <= 0: flash("Invalid ESPP","danger"); return redirect(url_for("index_full"))
+    if not d or shares <= 0:
+        flash("Invalid ESPP: Date and positive shares required","danger"); return redirect(url_for("index_full"))
     purchase = safe_decimal(purchase_str) if purchase_str else None
     market = safe_decimal(market_str) if market_str else None
     discount = Decimal("0")
-    qualifying = True
+    qualifying = True  # Default for HTML, user can edit later
     if market and purchase and market > 0 and purchase < market:
         discount = ((market - purchase) / market) * 100
+        if discount > 15:
+            flash(f"Error: ESPP discount {q2(discount)}% > 15%. This plan may not qualify for relief. Set qualifying=False in edit mode or consult HMRC. Submission blocked for accuracy.", "error")
+            return redirect(url_for("index_full"))
         qualifying = discount <= 15
         if not qualifying:
-            flash(f"Warning: ESPP discount {q2(discount)}% > 15%. May not qualify for relief. Full market value treated as income.", "warning")
+            flash(f"Warning: ESPP discount {q2(discount)}% > 15%. Full market value treated as income; ensure PAYE is flagged.", "warning")
     p = ESPPPurchase(date=d, shares_retained=shares, purchase_price_usd=purchase, market_price_usd=market, discount=discount, paye_tax_gbp=safe_decimal(paye) if paye else None, exchange_rate=safe_decimal(exch) if exch else None, discount_taxed_paye=discount_taxed, qualifying=qualifying)
-    db.session.add(p); db.session.commit(); flash("ESPP added","success"); return redirect(url_for("index_full"))
+    db.session.add(p); db.session.commit(); flash("ESPP added","success")
+    # Trigger partial recalc
+    recalc_all(sale_filter=d.isoformat())
+    return redirect(url_for("index_full"))
 
 @app.route("/edit_espp/<int:id>", methods=["GET","POST"])
 def edit_espp(id):
     p = ESPPPurchase.query.get_or_404(id)
     if request.method=="POST":
-        p.date = to_date(request.form.get("date")); p.shares_retained = safe_decimal(request.form.get("shares_retained"))
+        new_shares = safe_decimal(request.form.get("shares_retained"))
+        if new_shares <= 0:
+            flash("Invalid: Positive shares required","danger")
+            return redirect(url_for("index_full"))
+        p.date = to_date(request.form.get("date"))
+        p.shares_retained = new_shares
         purchase_str = request.form.get("purchase_price_usd")
         market_str = request.form.get("market_price_usd")
         purchase = safe_decimal(purchase_str) if purchase_str else None
         market = safe_decimal(market_str) if market_str else None
         discount = Decimal("0")
-        qualifying = True
+        qualifying = True  # Default, but check if form has it; for HTML, assume user sets
         if market and purchase and market > 0 and purchase < market:
             discount = ((market - purchase) / market) * 100
+            if discount > 15:
+                flash(f"Error: ESPP discount {q2(discount)}% > 15%. Set qualifying=False or adjust prices for submission.", "error")
+                return redirect(url_for("index_full"))
             qualifying = discount <= 15
             if not qualifying:
-                flash(f"Warning: ESPP discount {q2(discount)}% > 15%. May not qualify for relief. Full market value treated as income.", "warning")
+                flash(f"Warning: ESPP discount {q2(discount)}% > 15%. Full market value treated as income; ensure PAYE flagged.", "warning")
         p.purchase_price_usd = purchase
         p.market_price_usd = market
         p.discount = discount
@@ -1112,7 +1179,13 @@ def edit_espp(id):
         p.paye_tax_gbp = safe_decimal(request.form.get("paye_tax_gbp")) if request.form.get("paye_tax_gbp") else None
         p.exchange_rate = safe_decimal(request.form.get("exchange_rate")) if request.form.get("exchange_rate") else None
         p.discount_taxed_paye = True if request.form.get("discount_taxed")=="on" else False
-        db.session.add(p); db.session.commit(); flash("ESPP updated","success"); return redirect(url_for("index_full"))
+        old_date = p.date
+        db.session.add(p); db.session.commit(); flash("ESPP updated","success")
+        new_date = p.date
+        recalc_date = min(old_date, new_date).isoformat() if old_date and new_date else None
+        if recalc_date:
+            recalc_all(sale_filter=recalc_date)
+        return redirect(url_for("index_full"))
     return f"<form method='post'><input type='date' name='date' value='{p.date}' required><input type='number' step='0.000001' name='shares_retained' value='{p.shares_retained}' required><input type='number' step='0.000001' name='purchase_price_usd' value='{p.purchase_price_usd or ''}'><input type='number' step='0.000001' name='market_price_usd' value='{p.market_price_usd or ''}'><input type='number' step='0.000001' name='paye_tax_gbp' value='{p.paye_tax_gbp or ''}'><input type='number' step='0.000001' name='exchange_rate' value='{p.exchange_rate or ''}'><label><input type='checkbox' name='discount_taxed' {'checked' if p.discount_taxed_paye else ''}> Discount taxed</label><button>Save</button></form>"
 
 @app.route("/delete_espp/<int:id>")
@@ -1128,17 +1201,32 @@ def add_sale():
     shares = safe_decimal(request.form.get("shares_sold"))
     price = request.form.get("sale_price_usd")
     exch = request.form.get("exchange_rate")
-    if not d or shares <= 0 or not price: flash("Invalid sale","danger"); return redirect(url_for("index_full"))
+    if not d or shares <= 0 or not price:
+        flash("Invalid sale: Date, positive shares, and price required","danger"); return redirect(url_for("index_full"))
     s = SaleInput(date=d, shares_sold=shares, sale_price_usd=safe_decimal(price), exchange_rate=safe_decimal(exch) if exch else None)
-    db.session.add(s); db.session.commit(); flash("Sale added","success"); return redirect(url_for("index_full"))
+    db.session.add(s); db.session.commit(); flash("Sale added","success")
+    # Trigger partial recalc for this sale
+    recalc_all(sale_filter=[s.id])
+    return redirect(url_for("index_full"))
 
 @app.route("/edit_sale/<int:id>", methods=["GET","POST"])
 def edit_sale(id):
     s = SaleInput.query.get_or_404(id)
     if request.method=="POST":
-        s.date = to_date(request.form.get("date")); s.shares_sold = safe_decimal(request.form.get("shares_sold"))
-        s.sale_price_usd = safe_decimal(request.form.get("sale_price_usd")); s.exchange_rate = safe_decimal(request.form.get("exchange_rate")) if request.form.get("exchange_rate") else None
-        db.session.add(s); db.session.commit(); flash("Sale updated","success"); return redirect(url_for("index_full"))
+        new_date = to_date(request.form.get("date"))
+        new_shares = safe_decimal(request.form.get("shares_sold"))
+        price = request.form.get("sale_price_usd")
+        if not new_date or new_shares <= 0 or not price:
+            flash("Invalid: Date, positive shares, and price required","danger")
+            return redirect(url_for("index_full"))
+        s.date = new_date
+        s.shares_sold = new_shares
+        s.sale_price_usd = safe_decimal(price)
+        s.exchange_rate = safe_decimal(request.form.get("exchange_rate")) if request.form.get("exchange_rate") else None
+        db.session.add(s); db.session.commit(); flash("Sale updated","success")
+        # Recompute this sale
+        recalc_all(sale_filter=[s.id])
+        return redirect(url_for("index_full"))
     return f"<form method='post'><input type='date' name='date' value='{s.date}' required><input type='number' step='0.000001' name='shares_sold' value='{s.shares_sold}' required><input type='number' step='0.000001' name='sale_price_usd' value='{s.sale_price_usd}' required><input type='number' step='0.000001' name='exchange_rate' value='{s.exchange_rate or ''}'><button>Save</button></form>"
 
 @app.route("/delete_sale/<int:id>")
@@ -1183,10 +1271,19 @@ def recalculate():
     explain_flag = True if request.args.get("explain") == "1" else False
     ty = request.args.get("tax_year")
     tax_year = int(ty) if ty and ty.isdigit() else None
-    res = recalc_all(explain=explain_flag, tax_year_filter=tax_year)
+    sale_filter = request.args.get("sale_id")  # Optional for partial
+    if sale_filter:
+        sale_filter = [int(sale_filter)]
+    res = recalc_all(explain=explain_flag, tax_year_filter=tax_year, sale_filter=sale_filter)
     if res.get("errors_present"): flash("Recalc completed but errors detected. See Audit.", "danger")
     else: flash("Recalc completed and snapshots stored.", "success")
     return redirect(url_for("index"))
+
+@app.route("/api/recalc_partial/<int:sale_id>", methods=["POST"])
+def recalc_partial(sale_id):
+    """Recompute only for a specific sale."""
+    res = recalc_all(sale_filter=[sale_id])
+    return jsonify(res)
 
 @app.route("/audit")
 def audit():
@@ -1226,7 +1323,7 @@ def download_csv(kind):
         net_gain = pos - neg
         if net_gain < 0: net_gain = Decimal("0")
         sa = Setting.query.get("CGT_Allowance"); sb = Setting.query.get("CGT_Rate")
-        cgt_allowance = safe_decimal(sa.value) if sa and safe_decimal(sa.value) > 0 and tax_year <= 2024 else get_aea(tax_year)
+        cgt_allowance = safe_decimal(sa.value) if sa and safe_decimal(sa.value) > 0 and tax_year < 2024 else get_aea(tax_year)
         cgt_rate_pct = safe_decimal(sb.value) if sb else Decimal("20")
         cgt_rate = cgt_rate_pct / Decimal("100")
         taxable = net_gain - cgt_allowance
@@ -1378,7 +1475,7 @@ def api_summary(year):
     sa = Setting.query.get("CGT_Allowance")
     sc = Setting.query.get("NonSavingsIncome")
     sd = Setting.query.get("BasicBandThreshold")
-    cgt_allowance = safe_decimal(sa.value) if sa and safe_decimal(sa.value) > 0 and year <= 2024 else get_aea(year)
+    cgt_allowance = safe_decimal(sa.value) if sa and safe_decimal(sa.value) > 0 and year < 2024 else get_aea(year)
     non_savings_income = safe_decimal(sc.value) if sc else Decimal("0")
     basic_threshold = safe_decimal(sd.value) if sd else Decimal("37700")
     basic_band_available = max(Decimal("0"), basic_threshold - non_savings_income)
@@ -1402,12 +1499,99 @@ def api_summary(year):
         "total_proceeds": float(q2(total_proceeds)),
         "total_cost": float(q2(total_cost)),
         "total_gain": float(q2(total_gain)),
+        "pos": float(q2(pos)),
+        "neg": float(q2(neg)),
         "net_gain": float(q2(net_gain)),
         "taxable_after_allowance": float(q2(taxable_gain)),
         "basic_taxable_gain": float(q2(basic_taxable)),
         "higher_taxable_gain": float(q2(higher_taxable)),
         "estimated_cgt": float(q2(estimated_cgt))
     })
+
+@app.route("/api/tax_years", methods=["GET"])
+def api_tax_years():
+    """Return unique tax years from existing data."""
+    from collections import defaultdict
+    years = set()
+    # From sales
+    sales = SaleInput.query.all()
+    for s in sales:
+        ty = s.date.year if s.date >= date(s.date.year, 4, 6) else s.date.year - 1
+        years.add(ty)
+    # From disposals (if no sales)
+    disposals = DisposalResult.query.all()
+    for d in disposals:
+        if d.sale_date:
+            ty = d.sale_date.year if d.sale_date >= date(d.sale_date.year, 4, 6) else d.sale_date.year - 1
+            years.add(ty)
+    return jsonify(sorted(list(years)))
+
+@app.route("/api/export/sa108/<int:year>")
+def api_export_sa108(year):
+    tax_start = date(year, 4, 6)
+    tax_end = date(year + 1, 4, 5)
+    disposals = DisposalResult.query.filter(
+        DisposalResult.sale_date >= tax_start,
+        DisposalResult.sale_date <= tax_end
+    ).order_by(DisposalResult.sale_date.asc()).all()
+    
+    if not disposals:
+        return jsonify({"error": "No disposals for the tax year"}), 404
+    
+    # Compute aggregates similar to summary
+    total_proceeds = sum([safe_decimal(r.proceeds_gbp or 0) for r in disposals])
+    total_cost = sum([safe_decimal(r.cost_basis_gbp or 0) for r in disposals])
+    total_gain = sum([safe_decimal(r.gain_gbp or 0) for r in disposals])
+    pos_gains = sum([safe_decimal(r.gain_gbp) for r in disposals if safe_decimal(r.gain_gbp) > 0])
+    losses = sum([abs(safe_decimal(r.gain_gbp)) for r in disposals if safe_decimal(r.gain_gbp) < 0])
+    net_gain = pos_gains - losses
+    if net_gain < 0:
+        net_gain = Decimal("0")
+        allowable_loss = abs(net_gain)
+        net_gain = Decimal("0")
+    else:
+        allowable_loss = Decimal("0")
+    
+    # Carry-forward losses
+    carry_forward_losses = CarryForwardLoss.query.filter(CarryForwardLoss.tax_year < year).all()
+    total_carry_forward_loss = sum(safe_decimal(loss.amount) for loss in carry_forward_losses)
+    net_gain_after_losses = max(Decimal("0"), net_gain - total_carry_forward_loss)
+    
+    # Allowance and tax
+    sa = Setting.query.get("CGT_Allowance")
+    cgt_allowance = safe_decimal(sa.value) if sa and safe_decimal(sa.value) > 0 and year < 2024 else get_aea(year)
+    chargeable_gain = max(Decimal("0"), net_gain_after_losses - cgt_allowance)
+    
+    # Simplified disposals list for SA108 Box 3 (UK assets)
+    uk_disposals = []  # Assuming all are shares in UK-listed companies or treated as such
+    for r in disposals:
+        if safe_decimal(r.gain_gbp) != 0:  # Only include with gain/loss
+            uk_disposals.append({
+                "date": r.sale_date.isoformat() if r.sale_date else None,
+                "description": f"Shares disposal (match: {r.matching_type})",
+                "proceeds": float(q2(safe_decimal(r.proceeds_gbp or 0))),
+                "cost": float(q2(safe_decimal(r.cost_basis_gbp or 0))),
+                "gain_loss": float(q2(safe_decimal(r.gain_gbp or 0)))
+            })
+    
+    sa108_data = {
+        "tax_year": year,
+        "tax_year_start": tax_start.isoformat(),
+        "tax_year_end": tax_end.isoformat(),
+        "total_proceeds": float(q2(total_proceeds)),
+        "total_costs": float(q2(total_cost)),
+        "total_gains": float(q2(pos_gains)),
+        "total_losses": float(q2(losses)),
+        "net_gain": float(q2(net_gain)),
+        "allowable_loss": float(q2(allowable_loss)),
+        "carry_forward_loss_used": float(q2(total_carry_forward_loss)),
+        "net_gain_after_losses": float(q2(net_gain_after_losses)),
+        "cgt_allowance_used": float(q2(min(cgt_allowance, net_gain_after_losses))),
+        "chargeable_gain": float(q2(chargeable_gain)),
+        "disposals": uk_disposals  # For Box 3 details
+    }
+    
+    return jsonify(sa108_data)
 
 # Helper to serialize model to dict
 def model_to_dict(model):
@@ -1459,9 +1643,15 @@ def create_vesting():
     if not data:
         return jsonify({'error': 'No data provided'}), 400
     try:
+        shares_vested = safe_decimal(data.get('shares_vested'))
+        if shares_vested <= 0:
+            raise ValueError("Shares vested must be positive")
+        date_val = to_date(data.get('date'))
+        if not date_val:
+            raise ValueError("Valid date required")
         v = Vesting(
-            date=to_date(data.get('date')),
-            shares_vested=safe_decimal(data.get('shares_vested')),
+            date=date_val,
+            shares_vested=shares_vested,
             price_usd=safe_decimal(data.get('price_usd')),
             shares_sold=safe_decimal(data.get('shares_sold', 0)),
             total_usd=safe_decimal(data.get('total_usd')),
@@ -1473,10 +1663,15 @@ def create_vesting():
         )
         db.session.add(v)
         db.session.commit()
+        # Trigger partial recalc
+        recalc_all(sale_filter=date_val.isoformat())
         return jsonify(model_to_dict(v)), 201
+    except ValueError as ve:
+        db.session.rollback()
+        return jsonify({'error': str(ve)}), 400
     except Exception as e:
         db.session.rollback()
-        return jsonify({'error': str(e)}), 400
+        return jsonify({'error': str(e)}), 500
 
 @app.route('/api/vestings', methods=['GET'])
 def get_vestings():
@@ -1490,8 +1685,14 @@ def update_vesting(id):
     if not data:
         return jsonify({'error': 'No data provided'}), 400
     try:
-        v.date = to_date(data.get('date', v.date))
-        v.shares_vested = safe_decimal(data.get('shares_vested', v.shares_vested))
+        new_date = to_date(data.get('date', v.date))
+        if not new_date:
+            raise ValueError("Valid date required")
+        new_shares = safe_decimal(data.get('shares_vested', v.shares_vested))
+        if new_shares <= 0:
+            raise ValueError("Shares vested must be positive")
+        v.date = new_date
+        v.shares_vested = new_shares
         v.price_usd = safe_decimal(data.get('price_usd', v.price_usd))
         v.shares_sold = safe_decimal(data.get('shares_sold', v.shares_sold))
         v.total_usd = safe_decimal(data.get('total_usd', v.total_usd))
@@ -1501,10 +1702,15 @@ def update_vesting(id):
         v.incidental_costs_gbp = safe_decimal(data.get('incidental_costs_gbp', v.incidental_costs_gbp))
         v.net_shares = safe_decimal(data.get('net_shares', v.net_shares))
         db.session.commit()
+        # Partial recalc from new_date
+        recalc_all(sale_filter=new_date.isoformat())
         return jsonify(model_to_dict(v))
+    except ValueError as ve:
+        db.session.rollback()
+        return jsonify({'error': str(ve)}), 400
     except Exception as e:
         db.session.rollback()
-        return jsonify({'error': str(e)}), 400
+        return jsonify({'error': str(e)}), 500
 
 @app.route('/api/vestings/<int:id>', methods=['DELETE'])
 def api_delete_vesting(id):
@@ -1520,26 +1726,46 @@ def create_espp():
     if not data:
         return jsonify({'error': 'No data provided'}), 400
     try:
+        shares_retained = safe_decimal(data.get('shares_retained'))
+        if shares_retained <= 0:
+            raise ValueError("Shares retained must be positive")
+        date_val = to_date(data.get('date'))
+        if not date_val:
+            raise ValueError("Valid date required")
+        purchase_price = safe_decimal(data.get('purchase_price_usd', 0))
+        market_price = safe_decimal(data.get('market_price_usd', 0))
+        qualifying = data.get('qualifying', True)
+        if market_price > 0 and purchase_price < market_price and purchase_price > 0:
+            discount = ((market_price - purchase_price) / market_price) * 100
+            if discount > 15 and qualifying:
+                raise ValueError(f"ESPP discount {discount:.2f}% > 15%. Set qualifying=False for non-qualifying plans or adjust prices.")
+        else:
+            discount = safe_decimal(data.get('discount', 0))
         p = ESPPPurchase(
-            date=to_date(data.get('date')),
-            shares_retained=safe_decimal(data.get('shares_retained')),
-            purchase_price_usd=safe_decimal(data.get('purchase_price_usd')),
-            market_price_usd=safe_decimal(data.get('market_price_usd')),
-            discount=safe_decimal(data.get('discount')),
+            date=date_val,
+            shares_retained=shares_retained,
+            purchase_price_usd=purchase_price,
+            market_price_usd=market_price,
+            discount=discount,
             exchange_rate=safe_decimal(data.get('exchange_rate')),
             total_gbp=safe_decimal(data.get('total_gbp')),
             discount_taxed_paye=data.get('discount_taxed_paye', True),
             paye_tax_gbp=safe_decimal(data.get('paye_tax_gbp')),
-            qualifying=data.get('qualifying', True),
+            qualifying=qualifying,
             incidental_costs_gbp=safe_decimal(data.get('incidental_costs_gbp', 0)),
             notes=data.get('notes', '')
         )
         db.session.add(p)
         db.session.commit()
+        # Trigger partial recalc
+        recalc_all(sale_filter=date_val.isoformat())
         return jsonify(model_to_dict(p)), 201
+    except ValueError as ve:
+        db.session.rollback()
+        return jsonify({'error': str(ve)}), 400
     except Exception as e:
         db.session.rollback()
-        return jsonify({'error': str(e)}), 400
+        return jsonify({'error': str(e)}), 500
 
 @app.route('/api/espp', methods=['GET'])
 def get_espp():
@@ -1553,23 +1779,43 @@ def update_espp(id):
     if not data:
         return jsonify({'error': 'No data provided'}), 400
     try:
-        p.date = to_date(data.get('date', p.date))
-        p.shares_retained = safe_decimal(data.get('shares_retained', p.shares_retained))
-        p.purchase_price_usd = safe_decimal(data.get('purchase_price_usd', p.purchase_price_usd))
-        p.market_price_usd = safe_decimal(data.get('market_price_usd', p.market_price_usd))
-        p.discount = safe_decimal(data.get('discount', p.discount))
+        new_date = to_date(data.get('date', p.date))
+        if not new_date:
+            raise ValueError("Valid date required")
+        new_shares = safe_decimal(data.get('shares_retained', p.shares_retained))
+        if new_shares <= 0:
+            raise ValueError("Shares retained must be positive")
+        purchase_price = safe_decimal(data.get('purchase_price_usd', p.purchase_price_usd))
+        market_price = safe_decimal(data.get('market_price_usd', p.market_price_usd))
+        qualifying = data.get('qualifying', p.qualifying)
+        if market_price > 0 and purchase_price < market_price and purchase_price > 0:
+            discount = ((market_price - purchase_price) / market_price) * 100
+            if discount > 15 and qualifying:
+                raise ValueError(f"ESPP discount {discount:.2f}% > 15%. Set qualifying=False for non-qualifying plans or adjust prices.")
+        else:
+            discount = safe_decimal(data.get('discount', p.discount))
+        p.date = new_date
+        p.shares_retained = new_shares
+        p.purchase_price_usd = purchase_price
+        p.market_price_usd = market_price
+        p.discount = discount
         p.exchange_rate = safe_decimal(data.get('exchange_rate', p.exchange_rate))
         p.total_gbp = safe_decimal(data.get('total_gbp', p.total_gbp))
         p.discount_taxed_paye = data.get('discount_taxed_paye', p.discount_taxed_paye)
         p.paye_tax_gbp = safe_decimal(data.get('paye_tax_gbp', p.paye_tax_gbp))
-        p.qualifying = data.get('qualifying', p.qualifying)
+        p.qualifying = qualifying
         p.incidental_costs_gbp = safe_decimal(data.get('incidental_costs_gbp', p.incidental_costs_gbp))
         p.notes = data.get('notes', p.notes)
         db.session.commit()
+        # Partial recalc
+        recalc_all(sale_filter=new_date.isoformat())
         return jsonify(model_to_dict(p))
+    except ValueError as ve:
+        db.session.rollback()
+        return jsonify({'error': str(ve)}), 400
     except Exception as e:
         db.session.rollback()
-        return jsonify({'error': str(e)}), 400
+        return jsonify({'error': str(e)}), 500
 
 @app.route('/api/espp/<int:id>', methods=['DELETE'])
 def api_delete_espp(id):
@@ -1585,19 +1831,30 @@ def create_sale():
     if not data:
         return jsonify({'error': 'No data provided'}), 400
     try:
+        shares_sold = safe_decimal(data.get('shares_sold'))
+        if shares_sold <= 0:
+            raise ValueError("Shares sold must be positive")
+        date_val = to_date(data.get('date'))
+        if not date_val:
+            raise ValueError("Valid date required")
         s = SaleInput(
-            date=to_date(data.get('date')),
-            shares_sold=safe_decimal(data.get('shares_sold')),
+            date=date_val,
+            shares_sold=shares_sold,
             sale_price_usd=safe_decimal(data.get('sale_price_usd')),
             exchange_rate=safe_decimal(data.get('exchange_rate')),
             incidental_costs_gbp=safe_decimal(data.get('incidental_costs_gbp', 0))
         )
         db.session.add(s)
         db.session.commit()
+        # Trigger partial recalc for this sale
+        recalc_all(sale_filter=[s.id])
         return jsonify(model_to_dict(s)), 201
+    except ValueError as ve:
+        db.session.rollback()
+        return jsonify({'error': str(ve)}), 400
     except Exception as e:
         db.session.rollback()
-        return jsonify({'error': str(e)}), 400
+        return jsonify({'error': str(e)}), 500
 
 @app.route('/api/sales', methods=['GET'])
 def get_sales():
@@ -1611,16 +1868,27 @@ def update_sale(id):
     if not data:
         return jsonify({'error': 'No data provided'}), 400
     try:
-        s.date = to_date(data.get('date', s.date))
-        s.shares_sold = safe_decimal(data.get('shares_sold', s.shares_sold))
+        new_date = to_date(data.get('date', s.date))
+        if not new_date:
+            raise ValueError("Valid date required")
+        new_shares = safe_decimal(data.get('shares_sold', s.shares_sold))
+        if new_shares <= 0:
+            raise ValueError("Shares sold must be positive")
+        s.date = new_date
+        s.shares_sold = new_shares
         s.sale_price_usd = safe_decimal(data.get('sale_price_usd', s.sale_price_usd))
         s.exchange_rate = safe_decimal(data.get('exchange_rate', s.exchange_rate))
         s.incidental_costs_gbp = safe_decimal(data.get('incidental_costs_gbp', s.incidental_costs_gbp))
         db.session.commit()
+        # Recompute this sale
+        recalc_all(sale_filter=[s.id])
         return jsonify(model_to_dict(s))
+    except ValueError as ve:
+        db.session.rollback()
+        return jsonify({'error': str(ve)}), 400
     except Exception as e:
         db.session.rollback()
-        return jsonify({'error': str(e)}), 400
+        return jsonify({'error': str(e)}), 500
 
 @app.route('/api/sales/<int:id>', methods=['DELETE'])
 def api_delete_sale(id):
@@ -1641,6 +1909,18 @@ def ensure_db_schema():
             return col in [r[1] for r in c.fetchall()]
         except Exception:
             return False
+    try:
+        c.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='carry_forward_losses'")
+        if not c.fetchone():
+            c.execute("""
+                CREATE TABLE carry_forward_losses (
+                    tax_year INTEGER PRIMARY KEY,
+                    amount NUMERIC NOT NULL,
+                    notes VARCHAR(200)
+                )
+            """)
+    except Exception:
+        pass
     try:
         c.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='vesting'")
         if c.fetchone():

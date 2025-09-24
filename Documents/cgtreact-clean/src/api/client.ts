@@ -90,3 +90,8 @@ export const fetchTransaction = async (id: number) => {
   const res = await api.get(`/transaction/${id}`);
   return res.data;
 };
+
+export const fetchSa108Export = async (year: number) => {
+  const res = await api.get(`/export/sa108/${year}`);
+  return res.data;
+};

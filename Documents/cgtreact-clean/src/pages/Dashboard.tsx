@@ -1,6 +1,7 @@
 import React, { useEffect, useState } from 'react';
 import { motion } from 'framer-motion';
 import { Typography, Button, Box, FormControl, Select, MenuItem } from '@mui/material';
+import { useNavigate } from 'react-router-dom';
 import { useAppStore } from '../store/useAppStore';
 import {
   fetchFragments,
@@ -45,6 +46,7 @@ const Dashboard = () => {
   const { selectedYear, mode, selectedFragment, setSelectedFragment } = useAppStore();
   const setStore = useAppStore.setState;
   const [loading, setLoading] = useState(false);
+  const navigate = useNavigate();
 
   const years = ['2022-23', '2023-24', '2024-25', '2025-26'];
 
@@ -85,30 +87,28 @@ const Dashboard = () => {
           lots,
         };
 
-        // Map summary to expected shape, computing missing fields
+        // Map summary to expected shape using backend fields
         const backendSummary = summaryRes;
-        const netGainAfterLosses = backendSummary.net_gain_after_losses || backendSummary.net_gain || 0;
-        const allowanceUsed = Math.min(backendSummary.cgt_allowance_gbp || 0, netGainAfterLosses);
-        const effectiveRate = netGainAfterLosses > 0 ? (backendSummary.estimated_cgt / netGainAfterLosses) * 100 : 0;
         const mappedSummary = {
           tax_year: selectedYear,
           tax_year_start: backendSummary.tax_year_start,
           tax_year_end: backendSummary.tax_year_end,
           cgt_allowance_gbp: backendSummary.cgt_allowance_gbp || 0,
           carry_forward_loss_gbp: backendSummary.carry_forward_loss_gbp || 0,
-          net_gain_after_losses: netGainAfterLosses,
-          allowance_used_gbp: allowanceUsed,
-          taxable_income: backendSummary.non_savings_income || 0,
-          basic_limit: backendSummary.basic_threshold || 37700,
-          basic_gain: backendSummary.basic_taxable_gain || 0,
-          higher_gain: backendSummary.higher_taxable_gain || 0,
-          effective_rate_percent: effectiveRate,
+          net_gain_after_losses: backendSummary.net_gain_after_losses || backendSummary.net_gain || 0,
+          non_savings_income: backendSummary.non_savings_income || 0,
+          basic_threshold: backendSummary.basic_threshold || 37700,
+          basic_band_available: backendSummary.basic_band_available || 0,
           total_disposals: backendSummary.total_disposals || 0,
           total_proceeds: backendSummary.total_proceeds || 0,
           total_cost: backendSummary.total_cost || 0,
           total_gain: backendSummary.total_gain || 0,
+          pos: backendSummary.pos || 0,
+          neg: backendSummary.neg || 0,
           net_gain: backendSummary.net_gain || 0,
           taxable_after_allowance: backendSummary.taxable_after_allowance || 0,
+          basic_taxable_gain: backendSummary.basic_taxable_gain || 0,
+          higher_taxable_gain: backendSummary.higher_taxable_gain || 0,
           estimated_cgt: backendSummary.estimated_cgt || 0,
         };
 
@@ -171,6 +171,16 @@ const Dashboard = () => {
               ))}
             </Select>
           </FormControl>
+        </motion.div>
+
+        <motion.div variants={itemVariants}>
+          <Button
+            variant="contained"
+            sx={{ mt: 2 }}
+            onClick={() => navigate('/editor')}
+          >
+            Edit Transactions
+          </Button>
         </motion.div>
 
         <motion.div variants={itemVariants}>
