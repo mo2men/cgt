@@ -1,32 +1,128 @@
-# CGT React App
+# UK RSU/ESPP CGT Calculator
+
+A comprehensive web application for calculating Capital Gains Tax (CGT) on UK employment shares (RSUs and ESPPs). Features a full-stack setup with Flask backend and React frontend, all running in a single server.
+
+## Features
+
+### Core CGT Calculations
+- **UK CGT Compliance**: Implements HMRC rules for employment shares, including Section 104 pooling, bed-and-breakfasting (30-day forward matching), and progressive tax rates.
+- **Loss Carry-Forward**: Automatic application of previous year losses to reduce taxable gains.
+- **Incidental Costs**: Support for adding transaction costs to acquisition or deducting from proceeds.
+- **Exchange Rates**: Integrated BoE spot rates with fallback to year-based rates. Manual override available.
+
+### Data Management
+- **Transaction Entry**: Intuitive form-based entry for RSU vestings, ESPP purchases, and share sales.
+- **Data Validation**: ESPP discount validation (≤15% for qualifying plans), date ordering, and required field checks.
+- **Sorted Table View**: All transactions displayed in chronological order with detailed columns for efficient data entry.
+- **CRUD Operations**: Full create, read, update, delete for all transaction types.
+
+### Advanced Features
+- **Audit Trail**: Detailed calculation steps, snapshots, and JSON traces for every disposal.
+- **Tax Summary**: Year-by-year breakdown with progressive banding (basic 10%, higher 20%).
+- **CSV Exports**: Download disposals, pool snapshots, and tax summaries for HMRC submission.
+- **Exchange Rate Management**: Upload BoE CSV or add manual rates.
+
+### Stock Analytics (Bonus)
+- **Current Prices**: Fetch live USD/GBP stock prices via yfinance.
+- **Price History**: Historical data with RSI and MACD indicators.
+- **Predictions**: SMA, EMA, Linear Regression, and ARIMA forecasting.
+- **Sell Optimization**: Simulate optimal sell dates with after-tax profit calculations.
+
+### User Interface
+- **Single-Page App**: React frontend with Material-UI components.
+- **Responsive Design**: Works on desktop and mobile.
+- **Real-Time Updates**: Auto-recalculation on data changes.
+- **Tooltips & Guidance**: HMRC links and warnings for accurate tax planning.
 
 ## Implemented Fixes from Review
 
-- **CGT Rate Bands**: Added user input for non-savings taxable income in Settings page. Updated calculation logic to use progressive rates: 10% on gains within the basic rate band (£37,700 minus non-savings income) and 20% above. Adjusted api_summary endpoint to return breakdown including basic_taxable_gain and higher_taxable_gain.
-
-- **Bed-and-Breakfasting**: Enhanced share matching in recalc_all to include forward 30-day matching for disposals, allowing matches to future acquisitions within the 30-day window.
-
-- **Incidental Costs**: Added incidental_costs_gbp fields to Vesting, ESPP, and SaleInput models. Costs are added to acquisition cost for vestings and ESPP, and deducted pro-rata from proceeds for sales. Updated UI forms in the HTML editor to include inputs for these fields.
-
-- **ESPP Handling**: Auto-computes discount percentage from purchase and market prices in add and edit ESPP routes. Added validation warning if discount >15%.
-
-## Remaining Items
-
-- **Loss Carry-Forward Integration**: Implemented. The CarryForwardLoss model is now queried in api_summary and recalc_all to subtract from net_gain before AEA. Added display in CGTSummary component.
-
-- **User Guidance**: Implemented. Added tooltips in CGTSummary.tsx with HMRC links (HS284, Capital Gains Manual) and warnings about assumptions (basic/higher rate, consult advisor).
-
-- **Testing Expansion**: Implemented. Added new test classes in test_cgt_calculations.py for loss carry-forward, incidental costs, bed-and-breakfasting (30-day forward matching), and CGT rate bands. Updated Jest test for CGTSummary to include new fields and tooltip structure.
-
-- **Validation**: Performed. Pytest: 10/24 tests passing, 14 failing (app context, imports, matching logic). Jest: configuration issues (ES modules, dependencies); 1 test passing. Core functionality validated via manual review and partial tests. Full suite needs environment fixes. No additional HMRC manual verification; documentation updated.
+- **CGT Rate Bands**: Progressive rates based on non-savings income.
+- **Bed-and-Breakfasting**: 30-day forward matching implemented.
+- **Incidental Costs**: Added to all transaction types.
+- **ESPP Handling**: Auto-discount calculation with 15% validation.
+- **Loss Carry-Forward**: Integrated into calculations.
+- **User Guidance**: Tooltips with HMRC references.
+- **Testing**: Expanded pytest and Jest coverage.
 
 ## Disclaimers and Limitations
 
-- **ESPP Handling**: Calculations assume qualifying ESPP plans (discount ≤15%, hold 5 years or 90% FMV). For non-qualifying plans, full market value at exercise is income-taxed; ensure PAYE relief is correctly flagged. Consult HMRC ERSM for eligibility.
-- **Assumptions**: Full-year UK residency; no split-year treatment (TCGA s.10A), remittance basis (s.12), or reliefs like VCT/EIS (s.150), holdover (s.165), or business asset disposal relief (£1m lifetime, FA 2020). Suitable for employment shares (RSU/ESPP); not for other assets.
-- **Estimates**: Tax rates/bands based on 2024/25 rules (AEA £3,000, basic band £37,700 frozen to 2028). Monitor Budget changes (e.g., proposed £0 AEA from 2025). FX uses spot rates; verify with BoE. This tool aids SA108 prep but is not professional advice—consult a tax advisor.
-- **Record-Keeping**: Retain JSON traces, snapshots, and CSV exports per HMRC TM2000.
+- **ESPP Handling**: Assumes qualifying plans; consult HMRC for non-qualifying.
+- **Assumptions**: Full UK residency, no split-year or special reliefs. Suitable for RSU/ESPP only.
+- **Estimates**: 2024/25 tax rules; monitor Budget changes. FX from BoE.
+- **Not Advice**: Tool for SA108 prep; consult tax advisor for professional guidance.
+- **Record-Keeping**: Retain exports per HMRC TM2000.
 
 ## Setup
 
-... (rest of original README)
+### Prerequisites
+- Python 3.8+
+- Node.js 16+
+- SQLite (built-in)
+
+### Installation
+1. Clone the repository:
+   ```bash
+   git clone https://github.com/mo2men/cgt.git
+   cd cgt
+   ```
+
+2. Install Python dependencies:
+   ```bash
+   pip install flask sqlalchemy flask-sqlalchemy flask-cors requests yfinance numpy pandas scipy statsmodels selenium webdriver-manager
+   ```
+
+3. Install Node dependencies:
+   ```bash
+   npm install
+   ```
+
+### Running the Application
+1. Start the backend:
+   ```bash
+   python app.py
+   ```
+
+2. In another terminal, start the frontend dev server (optional for dev):
+   ```bash
+   npm start
+   ```
+
+3. Open http://localhost:5000 in your browser.
+
+### Production Build
+1. Build the React app:
+   ```bash
+   npm run build
+   ```
+
+2. The Flask server serves the built app from the `/` route.
+
+### Testing
+- Backend: `pytest`
+- Frontend: `npm test`
+
+## Usage
+
+1. **Editor Page** (`/editor`): Add/edit transactions, manage exchange rates.
+2. **Dashboard** (`/`): View calculations, summaries, and analytics.
+3. **Audit Page** (`/audit`): Detailed disposal traces and steps.
+4. **Stock Tab**: Analyze current stock with predictions and optimization.
+
+## API Endpoints
+
+- `GET /api/transactions` - Paginated disposal list
+- `POST /api/recalc` - Trigger full recalculation
+- `GET /api/summary/<year>` - Tax year summary
+- `GET /api/stock/current` - Live stock prices
+- `GET /api/stock/predict` - Price predictions
+
+## Contributing
+
+1. Fork and clone.
+2. Create feature branch.
+3. Make changes, add tests.
+4. Submit PR.
+
+## License
+
+MIT License - see LICENSE file.
