@@ -1,15 +1,16 @@
 import React, { useState, useEffect } from 'react';
 import { motion } from 'framer-motion';
 import {
-  Typography, TextField, Button, MenuItem, Select, FormControl, InputLabel, Switch, FormControlLabel, Box, Alert, Table, TableBody, TableCell, TableContainer, TableHead, TableRow, Paper, IconButton,
-  Stepper, Step, StepLabel, StepContent, Dialog, DialogActions, DialogContent, DialogContentText, DialogTitle
+  Typography, TextField, Button, MenuItem, Select, FormControl, InputLabel, Switch, FormControlLabel, Box, Alert, Table, TableBody, TableCell, TableContainer, TableHead, TableRow, Paper, IconButton, Snackbar,
+  Stepper, Step, StepLabel, StepContent, Dialog, DialogActions, DialogContent, DialogContentText, DialogTitle, Tabs, Tab
 } from '@mui/material';
-import { Edit as EditIcon, Delete as DeleteIcon } from '@mui/icons-material';
+import { Edit as EditIcon, Delete as DeleteIcon, AccountBalance as AccountBalanceIcon, ShoppingCart as ShoppingCartIcon, Sell as SellIcon } from '@mui/icons-material';
 import {
   fetchFragments, fetchSnapshot, fetchSummary,
   createVesting, getVestings, updateVesting, deleteVesting,
   createEspp, getEspp, updateEspp, deleteEspp,
-  createSale, getSales, updateSale, deleteSale
+  createSale, getSales, updateSale, deleteSale,
+  getRates, uploadBoeCsv, addRate, deleteRate
 } from '../api/client';
 
 const containerVariants = {
@@ -42,7 +43,9 @@ const inputVariants = {
   tap: { scale: 0.98 },
 } as const;
 
-const EditorForm = () => {
+import { useAppStore } from '../store/useAppStore';
+
+const EditorForm = ({ selectedYear }: { selectedYear: string }) => {
   const [activeStep, setActiveStep] = useState(0);
   const [type, setType] = useState<'rsu' | 'espp' | 'sale'>('rsu');
   const [form, setForm] = useState<any>({});
@@ -50,21 +53,27 @@ const EditorForm = () => {
   const [computedDiscount, setComputedDiscount] = useState(0);
   const [qualifying, setQualifying] = useState(true);
   const [errors, setErrors] = useState<string>('');
+  const [success, setSuccess] = useState<string>('');
   const [loading, setLoading] = useState(false);
   const [vestings, setVestings] = useState<any[]>([]);
   const [espps, setEspps] = useState<any[]>([]);
   const [sales, setSales] = useState<any[]>([]);
   const [confirmDialog, setConfirmDialog] = useState<{open: boolean, id: number, entryType: 'rsu' | 'espp' | 'sale'}>({open: false, id: 0, entryType: 'rsu'});
+  const [tabValue, setTabValue] = useState(0);
+  const [rates, setRates] = useState<any[]>([]);
+  const [rateForm, setRateForm] = useState({ date: '', rate: '' });
+  const [file, setFile] = useState<File | null>(null);
 
   const steps = ['Basics', 'Details', 'Review & Submit'];
 
   useEffect(() => {
     const fetchData = async () => {
       try {
-        const [v, e, s] = await Promise.all([getVestings(), getEspp(), getSales()]);
+        const [v, e, s, r] = await Promise.all([getVestings(), getEspp(), getSales(), getRates()]);
         setVestings(v);
         setEspps(e);
         setSales(s);
+        setRates(r);
       } catch (err) {
         console.error('Error fetching data:', err);
       }
@@ -95,7 +104,7 @@ const EditorForm = () => {
 
   const handleNext = () => {
     if (activeStep === 0 && (!form.date || !form.quantity)) {
-      alert('Date and quantity required');
+      setErrors('Date and quantity required');
       return;
     }
     if (activeStep < steps.length - 1) {
@@ -119,6 +128,7 @@ const EditorForm = () => {
       market_price_usd: entry.market_price_usd,
       discount_taxed_paye: entry.discount_taxed_paye,
       paye_tax_gbp: entry.paye_tax_gbp,
+      tax_paid_gbp: entry.tax_paid_gbp,
       exchange_rate: entry.exchange_rate,
       incidental_costs_gbp: entry.incidental_costs_gbp,
       notes: entry.notes,
@@ -145,10 +155,10 @@ const EditorForm = () => {
       setVestings(v);
       setEspps(e);
       setSales(s);
-      await fetchFragments(); // Trigger recalc
-      alert('Deleted successfully');
+      await fetchFragments(selectedYear.split('-')[0]); // Trigger recalc
+      setSuccess('Deleted successfully');
     } catch (err) {
-      alert('Error deleting');
+      setErrors('Error deleting');
     }
   };
 
@@ -165,16 +175,67 @@ const EditorForm = () => {
     setConfirmDialog({ open: false, id: 0, entryType: 'rsu' });
   };
 
+  const handleTabChange = (event: React.SyntheticEvent, newValue: number) => {
+    setTabValue(newValue);
+  };
+
+  const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    if (e.target.files) {
+      setFile(e.target.files[0]);
+    }
+  };
+
+  const handleUploadCsv = async () => {
+    if (!file) return;
+    try {
+      await uploadBoeCsv(file);
+      setFile(null);
+      const r = await getRates();
+      setRates(r);
+      setSuccess('CSV uploaded successfully');
+    } catch (err) {
+      setErrors('Error uploading CSV');
+    }
+  };
+
+  const handleAddRate = async () => {
+    if (!rateForm.date || !rateForm.rate) {
+      setErrors('Date and rate required');
+      return;
+    }
+    try {
+      await addRate({ date: rateForm.date, rate: parseFloat(rateForm.rate) });
+      setRateForm({ date: '', rate: '' });
+      const r = await getRates();
+      setRates(r);
+      setSuccess('Rate added successfully');
+    } catch (err) {
+      setErrors('Error adding rate');
+    }
+  };
+
+  const handleDeleteRate = async (id: number) => {
+    try {
+      await deleteRate(id);
+      const r = await getRates();
+      setRates(r);
+      setSuccess('Rate deleted successfully');
+    } catch (err) {
+      setErrors('Error deleting rate');
+    }
+  };
+
   const handleSubmit = async () => {
     if (!form.date || !form.quantity) {
       setErrors('Date and quantity required');
       return;
     }
     if (errors) {
-      alert(errors);
       return;
     }
     setLoading(true);
+    setErrors('');
+    setSuccess('');
     try {
       let res;
       if (editingId) {
@@ -224,33 +285,77 @@ const EditorForm = () => {
       setEspps(e);
       setSales(s);
       // Trigger recalc
-      await fetchFragments();
-      await fetchSummary('2023');
-      alert(editingId ? 'Updated successfully' : 'Created and recalculated!');
+      await fetchFragments(selectedYear);
+      await fetchSummary(parseInt(selectedYear.split('-')[0]));
+      await fetchFragments(selectedYear.split('-')[0]);
+      setSuccess(editingId ? 'Updated successfully' : 'Created and recalculated!');
       setForm({});
       setEditingId(null);
       setActiveStep(0);
-      setErrors('');
     } catch (err: any) {
       console.error(err);
-      setErrors(err.message || 'Error submitting');
-      alert(err.message || 'Error submitting');
+      const errorMsg = err.message || 'Error submitting';
+      setErrors(errorMsg);
     } finally {
       setLoading(false);
     }
   };
 
   const getStepContent = (step: number) => {
+    const exchangeRate = form.exchange_rate || 1.3; // Default preview rate
+    const quantity = parseFloat(form.quantity || '0');
+    const getPreview = () => {
+      if (type === 'rsu' && quantity > 0 && form.value) {
+        const totalUsd = quantity * parseFloat(form.value || '0');
+        const totalGbp = totalUsd / exchangeRate + (form.tax_paid_gbp || 0) + (form.incidental_costs_gbp || 0);
+        const netShares = quantity - (form.shares_sold || 0);
+        const avgCost = totalGbp / netShares;
+        return (
+          <Box sx={{ mt: 2 }}>
+            <Typography variant="subtitle2">Preview (est. rate {exchangeRate}):</Typography>
+            <Typography>USD Total: ${totalUsd.toFixed(2)}</Typography>
+            <Typography>GBP Total (inc. tax/incidental): £{totalGbp.toFixed(2)}</Typography>
+            <Typography>Net Shares: {netShares.toFixed(6)}</Typography>
+            <Typography>Per Share Cost: £{avgCost.toFixed(2)}</Typography>
+          </Box>
+        );
+      } else if (type === 'espp' && quantity > 0 && form.purchase_price_usd) {
+        const totalUsd = quantity * parseFloat(form.purchase_price_usd || '0');
+        const totalGbp = totalUsd / exchangeRate + (form.paye_tax_gbp || 0) + (form.incidental_costs_gbp || 0);
+        const avgCost = totalGbp / quantity;
+        return (
+          <Box sx={{ mt: 2 }}>
+            <Typography variant="subtitle2">Preview Cost Basis (est. rate {exchangeRate}):</Typography>
+            <Typography>USD Total: ${totalUsd.toFixed(2)}</Typography>
+            <Typography>GBP Total (inc. PAYE/incidental): £{totalGbp.toFixed(2)}</Typography>
+            <Typography>Per Share: £{avgCost.toFixed(2)}</Typography>
+          </Box>
+        );
+      } else if (type === 'sale' && quantity > 0 && form.sale_price_usd) {
+        const proceedsUsd = quantity * parseFloat(form.sale_price_usd || '0');
+        const proceedsGbp = proceedsUsd / exchangeRate - (form.incidental_costs_gbp || 0);
+        return (
+          <Box sx={{ mt: 2 }}>
+            <Typography variant="subtitle2">Preview Proceeds (est. rate {exchangeRate}):</Typography>
+            <Typography>USD Total: ${proceedsUsd.toFixed(2)}</Typography>
+            <Typography>GBP Proceeds (net incidental): £{proceedsGbp.toFixed(2)}</Typography>
+            <Typography>Per Share: £{(proceedsGbp / quantity).toFixed(2)}</Typography>
+          </Box>
+        );
+      }
+      return null;
+    };
+
     switch (step) {
       case 0:
         return (
           <Box sx={{ mt: 2 }}>
             <FormControl fullWidth>
               <InputLabel>Type</InputLabel>
-              <Select 
-                value={type} 
+              <Select
+                value={type}
                 onChange={(e) => setType(e.target.value as any)}
-                sx={{ 
+                sx={{
                   transition: 'all 0.3s ease',
                   '&:hover': { boxShadow: '0 0 15px rgba(74, 0, 224, 0.2)' }
                 }}
@@ -277,6 +382,7 @@ const EditorForm = () => {
               value={form.quantity || ''}
               onChange={(e) => handleChange('quantity', parseFloat(e.target.value))}
             />
+            {getPreview()}
           </Box>
         );
       case 1:
@@ -285,7 +391,7 @@ const EditorForm = () => {
             {type === 'rsu' && (
               <>
                 <TextField
-                  label="USD Value"
+                  label="Price USD (per share)"
                   type="number"
                   fullWidth
                   sx={{ mt: 2 }}
@@ -293,19 +399,28 @@ const EditorForm = () => {
                   onChange={(e) => handleChange('value', parseFloat(e.target.value))}
                 />
                 <TextField
-                  label="Shares Sold"
+                  label="Shares Sold for Tax"
                   type="number"
                   fullWidth
                   sx={{ mt: 2 }}
                   value={form.shares_sold || ''}
                   onChange={(e) => handleChange('shares_sold', parseFloat(e.target.value))}
                 />
+                <TextField
+                  label="Tax Paid GBP"
+                  type="number"
+                  fullWidth
+                  sx={{ mt: 2 }}
+                  value={form.tax_paid_gbp || ''}
+                  onChange={(e) => handleChange('tax_paid_gbp', parseFloat(e.target.value))}
+                />
+                {getPreview()}
               </>
             )}
             {type === 'espp' && (
               <>
                 <TextField
-                  label="Purchase Price USD"
+                  label="Purchase Price USD (per share)"
                   type="number"
                   fullWidth
                   sx={{ mt: 2 }}
@@ -313,7 +428,7 @@ const EditorForm = () => {
                   onChange={(e) => handleChange('purchase_price_usd', parseFloat(e.target.value))}
                 />
                 <TextField
-                  label="Market Price USD"
+                  label="Market Price USD (per share)"
                   type="number"
                   fullWidth
                   sx={{ mt: 2 }}
@@ -354,27 +469,28 @@ const EditorForm = () => {
                   value={form.paye_tax_gbp || ''}
                   onChange={(e) => handleChange('paye_tax_gbp', parseFloat(e.target.value))}
                 />
-                {/* Simple Preview */}
-                {form.quantity && form.purchase_price_usd && (
-                  <Box sx={{ mt: 2 }}>
-                    <Typography variant="subtitle2">Preview Cost Basis (est. using current rate 1.3):</Typography>
-                    <Typography>USD Total: ${(form.quantity * parseFloat(form.purchase_price_usd || '0')).toFixed(2)}</Typography>
-                    <Typography>GBP Total: £{((form.quantity * parseFloat(form.purchase_price_usd || '0')) / 1.3 + (form.paye_tax_gbp || 0) + (form.incidental_costs_gbp || 0)).toFixed(2)}</Typography>
-                    <Typography>Per Share: £{((form.quantity * parseFloat(form.purchase_price_usd || '0')) / 1.3 / form.quantity + (form.paye_tax_gbp || 0) / form.quantity).toFixed(2)}</Typography>
-                  </Box>
-                )}
+                <TextField
+                  label="Tax Paid GBP"
+                  type="number"
+                  fullWidth
+                  sx={{ mt: 2 }}
+                  value={form.tax_paid_gbp || ''}
+                  onChange={(e) => handleChange('tax_paid_gbp', parseFloat(e.target.value))}
+                />
+                {getPreview()}
               </>
             )}
             {type === 'sale' && (
               <>
                 <TextField
-                  label="Sale Price USD"
+                  label="Sale Price USD (per share)"
                   type="number"
                   fullWidth
                   sx={{ mt: 2 }}
                   value={form.sale_price_usd || ''}
                   onChange={(e) => handleChange('sale_price_usd', parseFloat(e.target.value))}
                 />
+                {getPreview()}
               </>
             )}
           </Box>
@@ -389,6 +505,7 @@ const EditorForm = () => {
               sx={{ mt: 2 }}
               value={form.exchange_rate || ''}
               onChange={(e) => handleChange('exchange_rate', parseFloat(e.target.value))}
+              helperText="Leave blank to use auto FX from BoE rates"
             />
             <TextField
               label="Incidental Costs GBP"
@@ -412,10 +529,12 @@ const EditorForm = () => {
               <Typography>Type: {type.toUpperCase()}</Typography>
               <Typography>Date: {form.date || 'N/A'}</Typography>
               <Typography>Quantity: {form.quantity || 'N/A'}</Typography>
-              {type === 'rsu' && <Typography>USD Value: £{form.value ? (form.value * (form.exchange_rate || 1)).toFixed(2) : 'N/A'}</Typography>}
+              {type === 'rsu' && form.value && <Typography>USD Value: ${ (form.quantity * parseFloat(form.value || '0')).toFixed(2) } → GBP est. £{ (form.quantity * parseFloat(form.value || '0') / exchangeRate).toFixed(2) }</Typography>}
               {type === 'espp' && <Typography>Discount: {computedDiscount.toFixed(2)}% (Qualifying: {qualifying ? 'Yes' : 'No'})</Typography>}
               {form.incidental_costs_gbp && <Typography>Incidental Costs: £{form.incidental_costs_gbp.toFixed(2)}</Typography>}
+              {getPreview()}
             </Box>
+            {errors && <Alert severity="error" sx={{ mt: 2 }}>{errors}</Alert>}
           </Box>
         );
       default:
@@ -423,7 +542,11 @@ const EditorForm = () => {
     }
   };
 
-  const entries = type === 'rsu' ? vestings : type === 'espp' ? espps : sales;
+  const allEntries = [
+    ...vestings.map(v => ({ ...v, entryType: 'rsu' })),
+    ...espps.map(e => ({ ...e, entryType: 'espp' })),
+    ...sales.map(s => ({ ...s, entryType: 'sale' }))
+  ].sort((a, b) => new Date(a.date).getTime() - new Date(b.date).getTime());
 
   return (
     <motion.div
@@ -432,75 +555,134 @@ const EditorForm = () => {
       animate="visible"
     >
       <Box sx={{ mt: 4 }}>
-        <motion.div variants={itemVariants}>
-          <Typography variant="h5">Add Transaction Wizard</Typography>
-        </motion.div>
+        <Tabs value={tabValue} onChange={handleTabChange} sx={{ mb: 2 }}>
+          <Tab label="Transactions" />
+          <Tab label="Exchange Rates" />
+        </Tabs>
+        {tabValue === 0 && (
+          <>
+            <motion.div variants={itemVariants}>
+              <Typography variant="h5">Add Transaction Wizard</Typography>
+            </motion.div>
 
-        <Stepper activeStep={activeStep} sx={{ mt: 4 }}>
-          {steps.map((label, index) => (
-            <Step key={label}>
-              <StepLabel>{label}</StepLabel>
-              <StepContent>
-                {getStepContent(index)}
-                <Box sx={{ mb: 2, display: 'flex', justifyContent: 'space-between' }}>
-                  <Button
-                    disabled={activeStep === 0}
-                    onClick={handleBack}
-                  >
-                    Back
-                  </Button>
-                  <Button
-                    variant="contained"
-                    onClick={activeStep === steps.length - 1 ? handleSubmit : handleNext}
-                    disabled={loading || !!errors}
-                  >
-                    {activeStep === steps.length - 1 ? 'Submit & Recalculate' : 'Next'}
-                  </Button>
-                </Box>
-              </StepContent>
-            </Step>
-          ))}
-        </Stepper>
-
-        {activeStep === steps.length && (
-          <Paper square elevation={0} sx={{ p: 3 }}>
-            <Typography>All steps completed!</Typography>
-            <Button onClick={() => setActiveStep(0)}>Reset</Button>
-          </Paper>
-        )}
-      </Box>
-
-      <Box sx={{ mt: 4 }}>
-        <Typography variant="h6">Existing Entries ({type.toUpperCase()})</Typography>
-        <TableContainer component={Paper} sx={{ mt: 2 }}>
-          <Table>
-            <TableHead>
-              <TableRow>
-                <TableCell>Date</TableCell>
-                <TableCell>Quantity</TableCell>
-                <TableCell>Price/Value</TableCell>
-                <TableCell>Actions</TableCell>
-              </TableRow>
-            </TableHead>
-            <TableBody>
-              {entries.map((entry) => (
-                <TableRow key={entry.id}>
-                  <TableCell>{entry.date}</TableCell>
-                  <TableCell>{entry.shares_vested || entry.shares_retained || entry.shares_sold}</TableCell>
-                  <TableCell>{entry.price_usd || entry.purchase_price_usd || entry.sale_price_usd}</TableCell>
-                  <TableCell>
-                    <IconButton onClick={() => handleEdit(entry, type)} size="small">
-                      <EditIcon />
-                    </IconButton>
-                    <IconButton onClick={() => handleDelete(entry.id, type)} size="small">
-                      <DeleteIcon />
-                    </IconButton>
-                  </TableCell>
-                </TableRow>
+            <Stepper activeStep={activeStep} sx={{ mt: 4 }}>
+              {steps.map((label, index) => (
+                <Step key={label}>
+                  <StepLabel>{label}</StepLabel>
+                  <StepContent>
+                    {getStepContent(index)}
+                    <Box sx={{ mb: 2, display: 'flex', justifyContent: 'space-between' }}>
+                      <Button
+                        disabled={activeStep === 0}
+                        onClick={handleBack}
+                      >
+                        Back
+                      </Button>
+                      <Button
+                        variant="contained"
+                        onClick={activeStep === steps.length - 1 ? handleSubmit : handleNext}
+                        disabled={loading || !!errors}
+                      >
+                        {activeStep === steps.length - 1 ? 'Submit & Recalculate' : 'Next'}
+                      </Button>
+                    </Box>
+                  </StepContent>
+                </Step>
               ))}
-            </TableBody>
-          </Table>
-        </TableContainer>
+            </Stepper>
+
+            {activeStep === steps.length && (
+              <Paper square elevation={0} sx={{ p: 3 }}>
+                <Typography>All steps completed!</Typography>
+                <Button onClick={() => setActiveStep(0)}>Reset</Button>
+              </Paper>
+            )}
+
+            <Box sx={{ mt: 4 }}>
+              <Typography variant="h6">All Existing Entries</Typography>
+              <TableContainer component={Paper} sx={{ mt: 2, borderRadius: 2, overflow: 'hidden' }}>
+                <Table sx={{ minWidth: 650 }}>
+                  <TableHead>
+                    <TableRow>
+                      <TableCell>Type</TableCell>
+                      <TableCell>Date</TableCell>
+                      <TableCell>Shares</TableCell>
+                      <TableCell>USD Price/Value</TableCell>
+                      <TableCell>Tax Paid GBP</TableCell>
+                      <TableCell>Incidental GBP</TableCell>
+                      <TableCell>Exchange Rate</TableCell>
+                      <TableCell>Notes</TableCell>
+                      <TableCell>Actions</TableCell>
+                    </TableRow>
+                  </TableHead>
+                  <TableBody>
+                    {allEntries.map((entry) => {
+                      const icon = entry.entryType === 'rsu' ? <AccountBalanceIcon /> : entry.entryType === 'espp' ? <ShoppingCartIcon /> : <SellIcon />;
+                      return (
+                        <TableRow key={`${entry.entryType}-${entry.id}`} sx={{ '&:nth-of-type(odd)': { backgroundColor: '#fafafa' }, '&:hover': { backgroundColor: '#e0e0e0' } }}>
+                          <TableCell>{icon} {entry.entryType.toUpperCase()}</TableCell>
+                          <TableCell>{entry.date}</TableCell>
+                          <TableCell>{(entry.shares_vested || entry.shares_retained || entry.shares_sold || 0).toFixed(6)}</TableCell>
+                          <TableCell>${(entry.price_usd || entry.purchase_price_usd || entry.sale_price_usd || 0).toFixed(2)}</TableCell>
+                          <TableCell>£{(entry.tax_paid_gbp || entry.paye_tax_gbp || 0).toFixed(2)}</TableCell>
+                          <TableCell>£{(entry.incidental_costs_gbp || 0).toFixed(2)}</TableCell>
+                          <TableCell>{entry.exchange_rate || ''}</TableCell>
+                          <TableCell>{entry.notes || ''}</TableCell>
+                          <TableCell>
+                            <IconButton onClick={() => handleEdit(entry, entry.entryType)} size="small" color="primary">
+                              <EditIcon />
+                            </IconButton>
+                            <IconButton onClick={() => handleDelete(entry.id, entry.entryType)} size="small" color="error">
+                              <DeleteIcon />
+                            </IconButton>
+                          </TableCell>
+                        </TableRow>
+                      );
+                    })}
+                  </TableBody>
+                </Table>
+              </TableContainer>
+            </Box>
+          </>
+        )}
+
+        {tabValue === 1 && (
+          <Box>
+            <Typography variant="h6">Upload Bank of England CSV</Typography>
+            <input type="file" accept=".csv" onChange={handleFileChange} />
+            <Button onClick={handleUploadCsv} disabled={!file}>Upload CSV</Button>
+            <a href="https://www.bankofengland.co.uk/boeapps/database/fromshowcolumns.asp?Travel=NIxIRxRSxSUx&FromSeries=1&ToSeries=50&DAT=RNG&FD=1&FM=Jan&FY=2020&TD=31&TM=Dec&TY=2025&FNY=&CSVF=TT&html.x=265&html.y=40&C=C8P&Filter=N#" target="_blank" rel="noopener noreferrer">Download BoE CSV</a>
+            <Typography variant="h6" sx={{ mt: 2 }}>Add Rate Manually</Typography>
+            <TextField label="Date" type="date" value={rateForm.date} onChange={(e) => setRateForm({ ...rateForm, date: e.target.value })} InputLabelProps={{ shrink: true }} />
+            <TextField label="Rate" type="number" inputProps={{ step: "0.000001" }} value={rateForm.rate} onChange={(e) => setRateForm({ ...rateForm, rate: e.target.value })} />
+            <Button onClick={handleAddRate}>Add Rate</Button>
+            <Typography variant="h6" sx={{ mt: 2 }}>Existing Rates</Typography>
+            <TableContainer component={Paper}>
+              <Table>
+                <TableHead>
+                  <TableRow>
+                    <TableCell>Date</TableCell>
+                    <TableCell>USD→GBP</TableCell>
+                    <TableCell>Actions</TableCell>
+                  </TableRow>
+                </TableHead>
+                <TableBody>
+                  {rates.map((rate) => (
+                    <TableRow key={rate.id}>
+                      <TableCell>{rate.date}</TableCell>
+                      <TableCell>{rate.usd_gbp}</TableCell>
+                      <TableCell>
+                        <IconButton onClick={() => handleDeleteRate(rate.id)} size="small">
+                          <DeleteIcon />
+                        </IconButton>
+                      </TableCell>
+                    </TableRow>
+                  ))}
+                </TableBody>
+              </Table>
+            </TableContainer>
+          </Box>
+        )}
       </Box>
 
       <Dialog
@@ -524,6 +706,14 @@ const EditorForm = () => {
           </Button>
         </DialogActions>
       </Dialog>
+
+      <Snackbar
+        open={!!success}
+        autoHideDuration={6000}
+        onClose={() => setSuccess('')}
+        message={success}
+        anchorOrigin={{ vertical: 'bottom', horizontal: 'center' }}
+      />
     </motion.div>
   );
 };
