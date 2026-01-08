@@ -4,17 +4,22 @@ const api = axios.create({
   baseURL: 'http://localhost:5002/api',
 });
 
-export const fetchFragments = async () => {
+export const fetchFragments = async (year: string) => {
   const res = await api.get('/transactions');
-  return res.data;
+  const yearNum = parseInt(year.split('-')[0]);
+  const filteredData = res.data.items.filter((item: any) => {
+    const saleYear = parseInt(item.sale_date.split('-')[0]);
+    return saleYear === yearNum;
+  });
+  return filteredData;
 };
 
-export const fetchSnapshot = async (year: string) => {
+export const fetchSnapshot = async (year: number) => {
   const res = await api.get(`/snapshot/${year}`);
   return res.data;
 };
 
-export const fetchSummary = async (year: string) => {
+export const fetchSummary = async (year: number) => {
   const res = await api.get(`/summary/${year}`);
   return res.data;
 };
@@ -94,4 +99,49 @@ export const fetchTransaction = async (id: number) => {
 export const fetchSa108Export = async (year: number) => {
   const res = await api.get(`/export/sa108/${year}`);
   return res.data;
+};
+
+// Stock API
+export const getStockCurrent = async (ticker: string) => {
+  const res = await api.get(`/stock/current?ticker=${ticker}`);
+  return res.data;
+};
+
+export const getStockHistory = async (ticker: string, days: number = 100) => {
+  const res = await api.get(`/stock/history?ticker=${ticker}&days=${days}`);
+  return res.data;
+};
+
+export const getStockPredict = async (ticker: string, options: { method: string; horizon: number }) => {
+  const params = new URLSearchParams({
+    ticker,
+    method: options.method,
+    horizon: options.horizon.toString()
+  });
+  const res = await api.get(`/stock/predict?${params.toString()}`);
+  return res.data;
+};
+
+export const getStockOptimize = async (ticker: string, options: { horizon: number; fraction: number }) => {
+  const params = new URLSearchParams({
+    ticker,
+    horizon: options.horizon.toString(),
+    fraction: options.fraction.toString()
+  });
+  const res = await api.get(`/stock/optimize?${params.toString()}`);
+  return res.data;
+};
+
+// Audit logs
+export const recalc = async (taxYear: string) => {
+  const res = await api.post('/recalc', { tax_year: taxYear });
+  return res.data;
+};
+
+export const fetchCalculationSteps = async (taxYear?: number, saleId?: number) => {
+  const params = new URLSearchParams();
+  if (taxYear) params.set('tax_year', taxYear.toString());
+  if (saleId) params.set('sale_id', saleId.toString());
+  const res = await api.get(`/calculation-steps?${params.toString()}`);
+  return res.data.steps;
 };

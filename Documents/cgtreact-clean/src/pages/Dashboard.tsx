@@ -1,17 +1,23 @@
 import React, { useEffect, useState } from 'react';
 import { motion } from 'framer-motion';
-import { Typography, Button, Box, FormControl, Select, MenuItem } from '@mui/material';
+import { Typography, Button, Box, FormControl, Select, MenuItem, Accordion, AccordionSummary, AccordionDetails, List, ListItem, ListItemText } from '@mui/material';
+import ExpandMoreIcon from '@mui/icons-material/ExpandMore';
 import { useNavigate } from 'react-router-dom';
 import { useAppStore } from '../store/useAppStore';
 import {
   fetchFragments,
   fetchSnapshot,
   fetchSummary,
+  fetchCalculationSteps,
+  recalc,
 } from '../api/client';
+import { CalculationStep } from '../types/models';
 import TransactionTable from '../components/TransactionTable';
 import PoolViewer from '../components/PoolViewer';
 import CGTSummary from '../components/CGTSummary';
 import TraceModel from '../components/TraceModel';
+import StockTracker from '../components/StockTracker';
+import OptimizeViewer from '../components/OptimizeViewer';
 
 const containerVariants = {
   hidden: { opacity: 0 },
@@ -43,7 +49,7 @@ const loadingVariants = {
 } as const;
 
 const Dashboard = () => {
-  const { selectedYear, mode, selectedFragment, setSelectedFragment } = useAppStore();
+  const { selectedYear, mode, selectedFragment, setSelectedFragment, auditSteps } = useAppStore();
   const setStore = useAppStore.setState;
   const [loading, setLoading] = useState(false);
   const navigate = useNavigate();
@@ -51,18 +57,21 @@ const Dashboard = () => {
   const years = ['2022-23', '2023-24', '2024-25', '2025-26'];
 
   useEffect(() => {
+    console.log('useEffect triggered with selectedYear:', selectedYear);
     const loadData = async () => {
+      console.log('Fetching data for year:', selectedYear);
       setLoading(true);
       try {
         const yearNum = parseInt(selectedYear.split('-')[0]);
-        const [fragmentsRes, snapshotRes, summaryRes] = await Promise.all([
-          fetchFragments(),
-          fetchSnapshot(yearNum.toString()),
-          fetchSummary(yearNum.toString()),
+        const [fragmentsRes, snapshotRes, summaryRes, stepsRes] = await Promise.all([
+          fetchFragments(selectedYear),
+          fetchSnapshot(yearNum),
+          fetchSummary(yearNum),
+          fetchCalculationSteps(yearNum),
         ]);
 
         // Map fragments to expected shape
-        const mappedFragments = fragmentsRes.items.map((f: any) => ({
+        const mappedFragments = fragmentsRes.map((f: any) => ({
           id: f.disposal_id,
           sale_date: f.sale_date,
           match_type: f.matching_type,
@@ -90,7 +99,7 @@ const Dashboard = () => {
         // Map summary to expected shape using backend fields
         const backendSummary = summaryRes;
         const mappedSummary = {
-          tax_year: selectedYear,
+          tax_year: yearNum,
           tax_year_start: backendSummary.tax_year_start,
           tax_year_end: backendSummary.tax_year_end,
           cgt_allowance_gbp: backendSummary.cgt_allowance_gbp || 0,
@@ -116,6 +125,7 @@ const Dashboard = () => {
           fragments: mappedFragments,
           snapshots: [mappedSnapshot],
           summaries: [mappedSummary],
+          auditSteps: stepsRes,
         });
       } catch (err) {
         console.error('Error loading dashboard data:', err);
@@ -125,14 +135,46 @@ const Dashboard = () => {
     };
 
     if (selectedYear) {
-      loadData();
+      const loadDataAndRecalc = async () => {
+        const yearNum = parseInt(selectedYear.split('-')[0]);
+        await recalc(yearNum.toString());
+        await loadData();
+      };
+      loadDataAndRecalc();
     }
-  }, [selectedYear, mode, setStore]);
+  }, [selectedYear, mode]);
+
+  const handleRecalc = async () => {
+    if (!selectedYear) return;
+    const yearNum = parseInt(selectedYear.split('-')[0]);
+    setLoading(true);
+    try {
+      await recalc(selectedYear.split('-')[0]);
+      // Refetch steps after recalc
+      const stepsRes = await fetchCalculationSteps(yearNum);
+      setStore({ auditSteps: stepsRes });
+    } catch (err: any) {
+      console.error('Recalc failed:', err);
+      let errorMsg = 'Unknown error';
+      if (err.response) {
+        // Backend responded with error status
+        errorMsg = err.response.data?.error || `Backend error: ${err.response.status}`;
+      } else if (err.request) {
+        // Network error: no response
+        errorMsg = 'Network error: Backend server not reachable. Start the server with `python app.py` at http://localhost:5002 and ensure /recalc endpoint supports POST with { tax_year }.';
+      } else {
+        errorMsg = err.message || 'Unknown error during recalc.';
+      }
+      alert(`Recalc failed: ${errorMsg}. For CGT audit logs, verify backend setup for UK tax calculations.`);
+    } finally {
+      setLoading(false);
+    }
+  };
 
   const handleExport = async () => {
     try {
       //This function is not implemented yet.  Placeholder for now.
-      const res = await fetchFragments();
+      const res = await fetchFragments(selectedYear);
       const url = window.URL.createObjectURL(new Blob([res.data]));
       const link = document.createElement('a');
       link.href = url;
@@ -144,9 +186,17 @@ const Dashboard = () => {
     }
   };
 
+  // Group audit steps by sale_input_id
+  const groupedSteps = auditSteps.reduce((acc: { [key: number]: CalculationStep[] }, step: CalculationStep) => {
+    const saleId = step.sale_input_id || 0;
+    if (!acc[saleId]) acc[saleId] = [];
+    acc[saleId].push(step);
+    return acc;
+  }, {});
+
+  console.log('Dashboard re-rendering with selectedYear:', selectedYear);
   return (
     <motion.div
-      variants={containerVariants}
       initial="hidden"
       animate="visible"
     >
@@ -162,7 +212,14 @@ const Dashboard = () => {
           <FormControl sx={{ mt: 2, minWidth: 120 }}>
             <Select
               value={selectedYear}
-              onChange={(e) => setStore({ selectedYear: e.target.value })}
+              onChange={(e) => {
+                const newSelectedYear = e.target.value;
+                setStore({ selectedYear: newSelectedYear });
+                console.log('Selected year updated to:', newSelectedYear);
+                // Trigger recalc after year change
+                const yearNum = parseInt(newSelectedYear.split('-')[0]);
+                recalc(yearNum.toString()); // recalc expects string
+              }}
             >
               {years.map((year) => (
                 <MenuItem key={year} value={year}>
@@ -185,6 +242,52 @@ const Dashboard = () => {
 
         <motion.div variants={itemVariants}>
           <TransactionTable />
+        </motion.div>
+
+        <motion.div variants={itemVariants}>
+          <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', mb: 2 }}>
+            <Typography variant="h6">Audit Logs</Typography>
+            {auditSteps.length === 0 && (
+              <Button variant="contained" size="small" onClick={handleRecalc} disabled={loading || !selectedYear}>
+                Run Recalc
+              </Button>
+            )}
+          </Box>
+          {auditSteps.length === 0 ? (
+            <Typography color="textSecondary">No audit logs available. Run recalc to generate steps.</Typography>
+          ) : (
+            Object.entries(groupedSteps).map(([saleIdStr, steps]: [string, CalculationStep[]]) => {
+              const saleId = parseInt(saleIdStr);
+              return (
+                <Accordion key={saleId} sx={{ mb: 2 }}>
+                  <AccordionSummary expandIcon={<ExpandMoreIcon />}>
+                    <Typography>Sale ID: {saleId} ({steps.length} steps)</Typography>
+                  </AccordionSummary>
+                  <AccordionDetails>
+                    <List dense>
+                      {steps.map((step) => (
+                        <ListItem key={step.id}>
+                          <ListItemText
+                            primary={`Step ${step.step_order}`}
+                            secondary={
+                              <>
+                                <Typography component="span" variant="body2" color="textPrimary">
+                                  {step.message}
+                                </Typography>
+                                <Typography variant="caption" color="textSecondary" sx={{ display: 'block' }}>
+                                  {step.timestamp}
+                                </Typography>
+                              </>
+                            }
+                          />
+                        </ListItem>
+                      ))}
+                    </List>
+                  </AccordionDetails>
+                </Accordion>
+              );
+            })
+          )}
         </motion.div>
 
         {selectedFragment && (
@@ -213,6 +316,14 @@ const Dashboard = () => {
 
         <motion.div variants={itemVariants}>
           <CGTSummary />
+        </motion.div>
+
+        <motion.div variants={itemVariants}>
+          <StockTracker />
+        </motion.div>
+
+        <motion.div variants={itemVariants}>
+          <OptimizeViewer />
         </motion.div>
 
         {loading && (
