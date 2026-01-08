@@ -20,6 +20,31 @@ from datetime import datetime, timedelta, date
 from decimal import Decimal, ROUND_HALF_UP, getcontext, InvalidOperation
 import io, csv, os, sqlite3, json
 import requests
+import yfinance as yf
+import numpy as np
+import pandas as pd
+from scipy.stats import linregress
+from statsmodels.tsa.arima.model import ARIMA
+from statsmodels.tsa.arima_model import ARIMAResults
+from datetime import datetime, timedelta, date
+import threading
+
+# Optional imports for advanced predictions (fallback if missing)
+try:
+    from prophet import Prophet
+    HAS_PROPHET = True
+except ImportError:
+    HAS_PROPHET = False
+    print("Prophet not installed; predictions fallback to basic methods.")
+
+try:
+    from tensorflow.keras.models import Sequential
+    from tensorflow.keras.layers import LSTM, Dense, Dropout
+    from sklearn.preprocessing import MinMaxScaler
+    HAS_TF = True
+except ImportError:
+    HAS_TF = False
+    print("TensorFlow not installed; LSTM predictions disabled.")
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
@@ -45,6 +70,9 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(BASE_DIR, "data.db")
 DB_URI = f"sqlite:///{DB_PATH}"
 DATE_FMT = "%Y-%m-%d"
+
+# Global lock for recalc to prevent concurrent runs
+recalc_lock = threading.Lock()
 
 app = Flask(__name__)
 app.config['SQLALCHEMY_DATABASE_URI'] = DB_URI
@@ -155,6 +183,20 @@ class CalculationDetail(db.Model):
     explanation = db.Column(db.Text, nullable=False)
 
 
+class StockData(db.Model):
+    __tablename__ = "stock_data"
+    id = db.Column(db.Integer, primary_key=True)
+    ticker = db.Column(db.String(10), nullable=False, index=True)
+    date = db.Column(db.Date, nullable=False, index=True)
+    price_usd = db.Column(db.Numeric(28,6), nullable=False)
+    price_gbp = db.Column(db.Numeric(28,6))
+    volume = db.Column(db.Integer)
+    is_prediction = db.Column(db.Boolean, default=False)
+    prediction_type = db.Column(db.String(20))
+    prediction_json = db.Column(db.Text)
+    notes = db.Column(db.String(200))
+
+
 # ---------- Utilities ----------
 def to_date(v):
     if not v:
@@ -208,7 +250,15 @@ def get_rate_for_date(target_date, rates_list):
     exact_rate = ExchangeRate.query.filter_by(date=target_date).first()
     if exact_rate:
         return safe_decimal(exact_rate.usd_gbp)
-    # Fallback to year-based
+    # Fallback to closest date in DB
+    # Find the rate with the smallest date difference, ordered by date for consistency
+    closest_rate = ExchangeRate.query.order_by(
+        db.func.abs(db.func.julianday(ExchangeRate.date) - db.func.julianday(target_date)),
+        ExchangeRate.date.asc()
+    ).first()
+    if closest_rate:
+        return safe_decimal(closest_rate.usd_gbp)
+    # If no rates in DB, fallback to year-based from loaded rates
     year = target_date.year
     if not rates_list:
         return Decimal("1")
@@ -267,36 +317,47 @@ def build_fragment_detail_struct(sale_price_usd: Decimal, lot, qty, rate_for_sal
     return {"equations": equations, "numeric_trace": numeric_trace}
 
 # ---------- Core matching & snapshot logic (enhanced) ----------
-def recalc_all(explain=False, tax_year_filter=None, sale_filter=None):
+def recalc_all(explain=False, tax_year_filter=None, sale_filter=None, hypothetical=False, sales_all=None):
     """
     sale_filter: Optional list of sale_input_ids or date_from (str 'YYYY-MM-DD') to recompute only affected sales.
     If None, full recalc (default).
+    hypothetical: If True, simulate without DB writes (for optimization).
+    sales_all: For hypothetical mode, provide list of SaleInput-like objects; otherwise ignored.
     """
-    if sale_filter is None:
-        # Full recalc: clear all
-        DisposalResult.query.delete()
-        PoolSnapshot.query.delete()
-        CalculationStep.query.delete()
-        CalculationDetail.query.delete()
-        db.session.commit()
-        full_mode = True
-    else:
+    if hypothetical:
         full_mode = False
-        # Partial: only delete affected results
-        if isinstance(sale_filter, list):
-            # Filter by sale IDs
-            affected_sales = SaleInput.query.filter(SaleInput.id.in_(sale_filter)).all()
-            affected_ids = [s.id for s in affected_sales]
-            DisposalResult.query.filter(DisposalResult.sale_input_id.in_(affected_ids)).delete()
-        elif isinstance(sale_filter, str):
-            # Filter by date_from: delete results for sales on/after date
-            date_from = to_date(sale_filter)
-            affected_sales = SaleInput.query.filter(SaleInput.date >= date_from).all()
-            affected_ids = [s.id for s in affected_sales]
-            DisposalResult.query.filter(DisposalResult.sale_input_id.in_(affected_ids)).delete()
+        if sales_all is not None:
+            sales_all = sales_all
         else:
-            raise ValueError("sale_filter must be list of IDs or date string")
-        db.session.commit()
+            sales_all = SaleInput.query.order_by(SaleInput.date.asc(), SaleInput.id.asc()).all()
+    else:
+        if sale_filter is None:
+            # Full recalc: clear all
+            DisposalResult.query.delete()
+            PoolSnapshot.query.delete()
+            CalculationStep.query.delete()
+            CalculationDetail.query.delete()
+            db.session.commit()
+            full_mode = True
+            sales_all = SaleInput.query.order_by(SaleInput.date.asc(), SaleInput.id.asc()).all()
+        else:
+            full_mode = False
+            # Partial: only delete affected results
+            if isinstance(sale_filter, list):
+                # Filter by sale IDs
+                affected_sales = SaleInput.query.filter(SaleInput.id.in_(sale_filter)).all()
+                affected_ids = [s.id for s in affected_sales]
+                DisposalResult.query.filter(DisposalResult.sale_input_id.in_(affected_ids)).delete()
+            elif isinstance(sale_filter, str):
+                # Filter by date_from: delete results for sales on/after date
+                date_from = to_date(sale_filter)
+                affected_sales = SaleInput.query.filter(SaleInput.date >= date_from).all()
+                affected_ids = [s.id for s in affected_sales]
+                DisposalResult.query.filter(DisposalResult.sale_input_id.in_(affected_ids)).delete()
+            else:
+                raise ValueError("sale_filter must be list of IDs or date string")
+            db.session.commit()
+            sales_all = SaleInput.query.order_by(SaleInput.date.asc(), SaleInput.id.asc()).all()
 
     rates = load_rates_sorted()
     lots = []
@@ -349,7 +410,7 @@ def recalc_all(explain=False, tax_year_filter=None, sale_filter=None):
     lots.sort(key=lambda x: (x["date"], x["entry"]))
     log_step(f"Total lots built: {len(lots)}")
 
-    sa = Setting.query.get("CGT_Allowance"); sb = Setting.query.get("CGT_Rate"); sc = Setting.query.get("NonSavingsIncome"); sd = Setting.query.get("BasicBandThreshold")
+    sa = db.session.get(Setting, "CGT_Allowance"); sb = db.session.get(Setting, "CGT_Rate"); sc = db.session.get(Setting, "NonSavingsIncome"); sd = db.session.get(Setting, "BasicBandThreshold")
     cgt_allowance = safe_decimal(sa.value) if sa and safe_decimal(sa.value) > 0 and (tax_year_filter is None or tax_year_filter < 2024) else get_aea(tax_year_filter)
     non_savings_income = safe_decimal(sc.value) if sc else Decimal("0")
     basic_threshold = safe_decimal(sd.value) if sd else Decimal("37700")
@@ -361,17 +422,18 @@ def recalc_all(explain=False, tax_year_filter=None, sale_filter=None):
     per_sale_snapshots = []
     all_fragments = []
 
-    # Filter sales if partial
-    if full_mode:
-        sales_all = SaleInput.query.order_by(SaleInput.date.asc(), SaleInput.id.asc()).all()
-    else:
-        if isinstance(sale_filter, list):
-            sales_all = SaleInput.query.filter(SaleInput.id.in_(sale_filter)).order_by(SaleInput.date.asc(), SaleInput.id.asc()).all()
-        elif isinstance(sale_filter, str):
-            date_from = to_date(sale_filter)
-            sales_all = SaleInput.query.filter(SaleInput.date >= date_from).order_by(SaleInput.date.asc(), SaleInput.id.asc()).all()
+    # For hypothetical, sales_all already set or provided
+    if not hypothetical:
+        if full_mode:
+            sales_all = SaleInput.query.order_by(SaleInput.date.asc(), SaleInput.id.asc()).all()
         else:
-            sales_all = []  # Should not happen
+            if isinstance(sale_filter, list):
+                sales_all = SaleInput.query.filter(SaleInput.id.in_(sale_filter)).order_by(SaleInput.date.asc(), SaleInput.id.asc()).all()
+            elif isinstance(sale_filter, str):
+                date_from = to_date(sale_filter)
+                sales_all = SaleInput.query.filter(SaleInput.date >= date_from).order_by(SaleInput.date.asc(), SaleInput.id.asc()).all()
+            else:
+                sales_all = []  # Should not happen
 
     for s in sales_all:
         log_step(f"Process sale {s.id} date {s.date} shares {safe_decimal(s.shares_sold)}", s.id)
@@ -460,11 +522,13 @@ def recalc_all(explain=False, tax_year_filter=None, sale_filter=None):
                 log_step("s104: No prior lots available", s.id)
 
         if remaining > 0:
-            dr = DisposalResult(sale_date=s.date, sale_input_id=s.id, matched_date=None, matching_type="ERROR: insufficient holdings",
-                                matched_shares=Decimal("0"), avg_cost_gbp=Decimal("0"), proceeds_gbp=Decimal("0"),
-                                cost_basis_gbp=Decimal("0"), gain_gbp=Decimal("0"), cgt_due_gbp=Decimal("0"),
-                                calculation_json=json.dumps({"error": "insufficient holdings", "requested": str(s.shares_sold), "remaining_unmatched": str(remaining)}))
-            db.session.add(dr); db.session.commit()
+            if not hypothetical:
+                dr = DisposalResult(sale_date=s.date, sale_input_id=s.id, matched_date=None, matching_type="ERROR: insufficient holdings",
+                                    matched_shares=Decimal("0"), avg_cost_gbp=Decimal("0"), proceeds_gbp=Decimal("0"),
+                                    cost_basis_gbp=Decimal("0"), gain_gbp=Decimal("0"), cgt_due_gbp=Decimal("0"),
+                                    calculation_json=json.dumps({"error": "insufficient holdings", "requested": str(s.shares_sold), "remaining_unmatched": str(remaining)}))
+                db.session.add(dr)
+                db.session.commit()
             log_step(f"ERROR sale {s.id} insufficient remaining {remaining}", s.id)
             errors_present = True
             pool_after = [{"entry": lot["entry"], "date": lot["date"].isoformat(), "source": lot["source"], "remaining": float(lot["remaining"]), "per_share_cost": float(q2(lot["avg_cost"])), "tooltip": lot.get("tooltip","")} for lot in lots]
@@ -504,12 +568,30 @@ def recalc_all(explain=False, tax_year_filter=None, sale_filter=None):
                                         matched_shares=qty, avg_cost_gbp=safe_decimal(lot["avg_cost"]), proceeds_gbp=adjusted_proceeds,
                                         cost_basis_gbp=cost_total, gain_gbp=adjusted_gain, cgt_due_gbp=Decimal("0"),
                                         calculation_json=json.dumps({"inputs": struct["inputs"], "equations": struct["equations"], "numeric_trace": struct["numeric_trace"]}))
-                    db.session.add(dr)
-                    db.session.commit()
-                    cd = CalculationDetail(disposal_id=dr.id, sale_input_id=s.id, equations="\n".join(struct["equations"]), explanation=f"Fragment {frag_index} matched {qty} shares from {lot['entry']} ({mtype}), adjusted for incidental costs")
-                    db.session.add(cd)
-                    db.session.commit()
-                    all_fragments.append(dr)
+                    if not hypothetical:
+                        db.session.add(dr)
+                        db.session.commit()
+                        cd = CalculationDetail(disposal_id=dr.id, sale_input_id=s.id, equations="\n".join(struct["equations"]), explanation=f"Fragment {frag_index} matched {qty} shares from {lot['entry']} ({mtype}), adjusted for incidental costs")
+                        db.session.add(cd)
+                        db.session.commit()
+                        all_fragments.append(dr)
+                    else:
+                        # Temp dr for hypothetical
+                        temp_dr = type('TempDR', (), {
+                            'id': -1,
+                            'sale_date': s.date,
+                            'sale_input_id': s.id,
+                            'matched_date': lot["date"],
+                            'matching_type': mtype,
+                            'matched_shares': qty,
+                            'avg_cost_gbp': safe_decimal(lot["avg_cost"]),
+                            'proceeds_gbp': adjusted_proceeds,
+                            'cost_basis_gbp': cost_total,
+                            'gain_gbp': adjusted_gain,
+                            'cgt_due_gbp': Decimal("0"),
+                            'calculation_json': json.dumps({"inputs": struct["inputs"], "equations": struct["equations"], "numeric_trace": struct["numeric_trace"]})
+                        })()
+                        all_fragments.append(temp_dr)
             else:
                 log_step(f"No proceeds to adjust for incidental £{q2(incidental_sale)} on sale {s.id}", s.id)
         else:
@@ -518,12 +600,30 @@ def recalc_all(explain=False, tax_year_filter=None, sale_filter=None):
                                     matched_shares=qty, avg_cost_gbp=safe_decimal(lot["avg_cost"]), proceeds_gbp=proceeds_total,
                                     cost_basis_gbp=cost_total, gain_gbp=gain, cgt_due_gbp=Decimal("0"),
                                     calculation_json=json.dumps({"inputs": struct["inputs"], "equations": struct["equations"], "numeric_trace": struct["numeric_trace"]}))
-                db.session.add(dr)
-                db.session.commit()
-                cd = CalculationDetail(disposal_id=dr.id, sale_input_id=s.id, equations="\n".join(struct["equations"]), explanation=f"Fragment {frag_index} matched {qty} shares from {lot['entry']} ({mtype})")
-                db.session.add(cd)
-                db.session.commit()
-                all_fragments.append(dr)
+                if not hypothetical:
+                    db.session.add(dr)
+                    db.session.commit()
+                    cd = CalculationDetail(disposal_id=dr.id, sale_input_id=s.id, equations="\n".join(struct["equations"]), explanation=f"Fragment {frag_index} matched {qty} shares from {lot['entry']} ({mtype})")
+                    db.session.add(cd)
+                    db.session.commit()
+                    all_fragments.append(dr)
+                else:
+                    # Temp dr for hypothetical
+                    temp_dr = type('TempDR', (), {
+                        'id': -1,
+                        'sale_date': s.date,
+                        'sale_input_id': s.id,
+                        'matched_date': lot["date"],
+                        'matching_type': mtype,
+                        'matched_shares': qty,
+                        'avg_cost_gbp': safe_decimal(lot["avg_cost"]),
+                        'proceeds_gbp': proceeds_total,
+                        'cost_basis_gbp': cost_total,
+                        'gain_gbp': gain,
+                        'cgt_due_gbp': Decimal("0"),
+                        'calculation_json': json.dumps({"inputs": struct["inputs"], "equations": struct["equations"], "numeric_trace": struct["numeric_trace"]})
+                    })()
+                    all_fragments.append(temp_dr)
 
         pool_after = [{"entry": lot["entry"], "date": lot["date"].isoformat(), "source": lot["source"], "remaining": float(lot["remaining"]), "per_share_cost": float(q2(lot["avg_cost"])), "tooltip": lot.get("tooltip","")} for lot in lots]
         per_sale_snapshots.append({"sale": {"id": s.id, "date": s.date.isoformat(), "shares": float(s.shares_sold)}, "changed": changed, "pool_after": pool_after, "error": False})
@@ -540,31 +640,40 @@ def recalc_all(explain=False, tax_year_filter=None, sale_filter=None):
             total_shares = sum([safe_decimal(lot["remaining"]) for lot in lots])
             total_cost = sum([safe_decimal(lot["avg_cost"]) * safe_decimal(lot["remaining"]) for lot in lots])
             avg_cost = (total_cost / total_shares) if total_shares != 0 else Decimal("0")
-            ps = PoolSnapshot(timestamp=datetime.utcnow(), tax_year=ty, snapshot_json=json.dumps(snaps), total_shares=total_shares, total_cost_gbp=total_cost, avg_cost_gbp=avg_cost)
-            db.session.add(ps)
+            if not hypothetical:
+                ps = PoolSnapshot(timestamp=datetime.utcnow(), tax_year=ty, snapshot_json=json.dumps(snaps), total_shares=total_shares, total_cost_gbp=total_cost, avg_cost_gbp=avg_cost)
+                db.session.add(ps)
     
         # Final snapshot only on full
         if full_mode:
             total_shares = sum([safe_decimal(lot["remaining"]) for lot in lots])
             total_cost = sum([safe_decimal(lot["avg_cost"]) * safe_decimal(lot["remaining"]) for lot in lots])
             avg_cost = (total_cost / total_shares) if total_shares != 0 else Decimal("0")
-            ps_final = PoolSnapshot(timestamp=datetime.utcnow(), tax_year=None, snapshot_json=json.dumps(per_sale_snapshots), total_shares=total_shares, total_cost_gbp=total_cost, avg_cost_gbp=avg_cost)
-            db.session.add(ps_final)
-        db.session.commit()
-        log_step("Stored snapshots and final pool snapshot.")
-    else:
-        db.session.commit()
-        log_step(f"Partial recalc complete for {len(sales_all)} sales. No new snapshots created.")
+            if not hypothetical:
+                ps_final = PoolSnapshot(timestamp=datetime.utcnow(), tax_year=None, snapshot_json=json.dumps(per_sale_snapshots), total_shares=total_shares, total_cost_gbp=total_cost, avg_cost_gbp=avg_cost)
+                db.session.add(ps_final)
+                db.session.commit()
+                log_step("Stored snapshots and final pool snapshot.")
+            else:
+                log_step("Hypothetical mode: No snapshots stored.")
+        else:
+            if not hypothetical:
+                db.session.commit()
+            log_step(f"Partial recalc complete for {len(sales_all)} sales. No new snapshots created.")
 
     taxable_summary = None
     if tax_year_filter is not None and not errors_present:
         tax_start = date(tax_year_filter,4,6); tax_end = date(tax_year_filter+1,4,5)
-        disposals = DisposalResult.query.filter(DisposalResult.sale_date >= tax_start, DisposalResult.sale_date <= tax_end).all()
+        if hypothetical:
+            # Use simulated all_fragments for hypothetical mode
+            disposals = [dr for dr in all_fragments if dr.sale_date and tax_start <= dr.sale_date <= tax_end]
+        else:
+            disposals = DisposalResult.query.filter(DisposalResult.sale_date >= tax_start, DisposalResult.sale_date <= tax_end).all()
         print(f"DEBUG: {len(disposals)} disposals for tax year {tax_year_filter}: {[ (d.sale_input_id, d.gain_gbp, type(d.gain_gbp)) for d in disposals ]}")
         gains = [safe_decimal(d.gain_gbp) for d in disposals if safe_decimal(d.gain_gbp) > 0]
         losses = [safe_decimal(d.gain_gbp) for d in disposals if safe_decimal(d.gain_gbp) < 0]
-        pos = sum(gains)
-        neg = sum([abs(l) for l in losses])
+        pos = safe_decimal(sum(gains))
+        neg = safe_decimal(sum([abs(l) for l in losses]))
         print(f"DEBUG: pos={pos} (type {type(pos)}), neg={neg} (type {type(neg)})")
         net_gain = pos - neg
         excess_current_loss = max(Decimal("0"), neg - pos)
@@ -574,19 +683,26 @@ def recalc_all(explain=False, tax_year_filter=None, sale_filter=None):
             loss_year = tax_year_filter
             loss = CarryForwardLoss.query.filter_by(tax_year=loss_year).first()
             if loss:
-                loss.amount += excess_current_loss
+                if not hypothetical:
+                    loss.amount += excess_current_loss
+                    db.session.add(loss)
+                    db.session.commit()
             else:
-                loss = CarryForwardLoss(tax_year=loss_year, amount=excess_current_loss, notes=f"Excess loss from {tax_year_filter}")
-                db.session.add(loss)
-        
+                if not hypothetical:
+                    loss = CarryForwardLoss(tax_year=loss_year, amount=excess_current_loss, notes=f"Excess loss from {tax_year_filter}")
+                    db.session.add(loss)
+                    db.session.commit()
+
         # Apply carry-forward losses from previous years
         carry_forward_losses = CarryForwardLoss.query.filter(CarryForwardLoss.tax_year < tax_year_filter).all()
-        total_carry_forward_loss = sum(safe_decimal(loss.amount) for loss in carry_forward_losses)
+        total_carry_forward_loss = safe_decimal(sum(safe_decimal(loss.amount) for loss in carry_forward_losses))
         
         # Subtract carry-forward losses from net gain before applying allowance
         net_gain_after_losses = max(Decimal("0"), net_gain - total_carry_forward_loss)
         
-        sa = Setting.query.get("CGT_Allowance"); sc = Setting.query.get("NonSavingsIncome"); sd = Setting.query.get("BasicBandThreshold")
+        sa = db.session.get(Setting, "CGT_Allowance")
+        sc = db.session.get(Setting, "NonSavingsIncome")
+        sd = db.session.get(Setting, "BasicBandThreshold")
         cgt_allowance = safe_decimal(sa.value) if sa and safe_decimal(sa.value) > 0 and tax_year_filter < 2024 else get_aea(tax_year_filter)
         non_savings_income = safe_decimal(sc.value) if sc else Decimal("0")
         basic_threshold = safe_decimal(sd.value) if sd else Decimal("37700")
@@ -609,6 +725,8 @@ def recalc_all(explain=False, tax_year_filter=None, sale_filter=None):
             "higher_taxable": float(q2(higher_taxable)),
             "estimated_cgt": float(estimated_cgt)
         }
+    if not hypothetical and taxable_summary:
+        pos = safe_decimal(taxable_summary["pos"])
         if pos > 0 and estimated_cgt > 0:
             for d in disposals:
                 g = safe_decimal(d.gain_gbp)
@@ -618,10 +736,10 @@ def recalc_all(explain=False, tax_year_filter=None, sale_filter=None):
                     d.cgt_due_gbp = alloc
                     db.session.add(d)
             db.session.commit()
-
-            # Commit the new carry-forward loss if added
-            if excess_current_loss > 0 and tax_year_filter is not None:
-                db.session.commit()
+        
+        # Commit the new carry-forward loss if added
+        if excess_current_loss > 0 and tax_year_filter is not None:
+            db.session.commit()
 
     return {"per_sale_snapshots": per_sale_snapshots, "errors_present": errors_present, "taxable_summary": taxable_summary}
 
@@ -1418,6 +1536,581 @@ def api_transaction(id):
         "details": details_list
     })
 
+
+# ---------- Stock Data Utilities ----------
+def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    """Compute RSI and MACD indicators."""
+    if df.empty or 'price_usd' not in df.columns:
+        return df
+    
+    prices = df['price_usd']
+    
+    # RSI (14-period)
+    delta = prices.diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+    rs = gain / loss
+    df['rsi'] = 100 - (100 / (1 + rs))
+    
+    # MACD (12,26,9)
+    ema12 = prices.ewm(span=12).mean()
+    ema26 = prices.ewm(span=26).mean()
+    df['macd'] = ema12 - ema26
+    df['macd_signal'] = df['macd'].ewm(span=9).mean()
+    df['macd_histogram'] = df['macd'] - df['macd_signal']
+    
+    return df
+
+
+def fetch_stock_history(ticker: str, days: int = 365) -> pd.DataFrame:
+    """Fetch historical stock data using yfinance; fallback to dummy data if fails."""
+    try:
+        stock = yf.Ticker(ticker)
+        try:
+            info = stock.info
+            if not info or 'symbol' not in info:
+                raise ValueError(f"Invalid ticker {ticker}")
+        except Exception:
+            raise ValueError(f"Invalid ticker {ticker}")
+        hist = stock.history(period=f"{days}d")
+        if hist.empty:
+            raise ValueError(f"No data for ticker {ticker}")
+        # Keep Close, Volume, High, Low for indicators
+        hist = hist[['Close', 'Volume', 'High', 'Low']].copy()
+        hist['Date'] = hist.index.date
+        hist.reset_index(drop=True, inplace=True)
+        hist.rename(columns={'Close': 'price_usd'}, inplace=True)
+        # Compute indicators
+        hist = compute_indicators(hist)
+        return hist
+    except ValueError:
+        raise
+    except Exception as e:
+        print(f"yfinance failed for {ticker}: {e}")
+        raise ValueError(f"Failed to fetch historical data for {ticker}")
+
+
+def cache_stock_data(df: pd.DataFrame, ticker: str, rates_list: list = None):
+    """Cache historical data to StockData, converting to GBP."""
+    if df.empty:
+        return
+    rates = load_rates_sorted() if rates_list is None else rates_list
+    for _, row in df.iterrows():
+        date = row['Date']
+        price_usd = safe_decimal(row['price_usd'])
+        rate = get_rate_for_date(date, rates)
+        price_gbp = price_usd / rate if rate != 0 else price_usd
+        existing = StockData.query.filter_by(ticker=ticker, date=date).first()
+        if not existing:
+            sd = StockData(
+                ticker=ticker,
+                date=date,
+                price_usd=price_usd,
+                price_gbp=price_gbp,
+                volume=int(row['Volume']) if 'Volume' in row else None,
+                notes=f"Fetched from yfinance on {datetime.now().date()}"
+            )
+            db.session.add(sd)
+    db.session.commit()
+
+
+def get_cached_history(ticker: str, days: int = 365) -> list:
+    """Get historical data from cache, fallback to fetch if incomplete, compute indicators."""
+    end_date = date.today()
+    start_date = end_date - timedelta(days=days)
+    cached = StockData.query.filter(
+        StockData.ticker == ticker,
+        StockData.date >= start_date,
+        StockData.date <= end_date,
+        StockData.is_prediction == False
+    ).order_by(StockData.date.asc()).all()
+    
+    rates = load_rates_sorted()
+    
+    if len(cached) < days * 0.8:  # If <80% cached, refresh
+        hist_df = fetch_stock_history(ticker, days)
+        if not hist_df.empty:
+            cache_stock_data(hist_df, ticker)
+            # Re-query after cache
+            cached = StockData.query.filter(
+                StockData.ticker == ticker,
+                StockData.date >= start_date,
+                StockData.date <= end_date,
+                StockData.is_prediction == False
+            ).order_by(StockData.date.asc()).all()
+    
+    # Reconstruct df and compute indicators if not cached (for now, compute always)
+    if cached:
+        df = pd.DataFrame([{
+            'date': sd.date,
+            'price_usd': float(sd.price_usd),
+            'price_gbp': float(sd.price_gbp) if sd.price_gbp else (float(sd.price_usd) / get_rate_for_date(sd.date, rates) or float(sd.price_usd)),
+            'volume': sd.volume
+        } for sd in cached])
+        df = compute_indicators(df)
+        # Update return to include indicators
+        return [{
+            'date': row['date'].isoformat(),
+            'price_usd': row['price_usd'],
+            'price_gbp': row['price_gbp'],
+            'volume': row['volume'],
+            'rsi': float(row['rsi']) if 'rsi' in row else None,
+            'macd': float(row['macd']) if 'macd' in row else None,
+            'macd_signal': float(row['macd_signal']) if 'macd_signal' in row else None
+        } for _, row in df.iterrows()]
+    
+    # Dummy data if no cache or fetch
+    print(f"No data for {ticker}; using dummy history for demo.")
+    dates = [end_date - timedelta(days=i) for i in range(days)]
+    base_price_usd = 100.0
+    sample_rate = Decimal('1.3')
+    np.random.seed(42)  # Reproducible
+    prices_usd = [base_price_usd + np.cumsum(np.random.normal(0.5, 1.0, days))[i] for i in range(days)]
+    prices_gbp = [float(Decimal(str(p)) / sample_rate) for p in prices_usd]
+    volumes = [1000000 + np.random.randint(-200000, 200000, size=days)[i] for i in range(days)]
+    dummy_df = pd.DataFrame({
+        'date': dates,
+        'price_usd': prices_usd,
+        'price_gbp': prices_gbp,
+        'volume': volumes
+    })
+    dummy_df = compute_indicators(dummy_df)
+    dummy_list = [{
+        'date': row['date'].isoformat(),
+        'price_usd': row['price_usd'],
+        'price_gbp': row['price_gbp'],
+        'volume': row['volume'],
+        'rsi': float(row['rsi']) if 'rsi' in row else None,
+        'macd': float(row['macd']) if 'macd' in row else None,
+        'macd_signal': float(row['macd_signal']) if 'macd_signal' in row else None
+    } for _, row in dummy_df.iterrows()]
+    return dummy_list
+
+
+def predict_prices(ticker: str, method: str = 'sma', horizon: int = 30, history_days: int = 100) -> list:
+    """Generate price predictions using basic methods (SMA/EMA/linear/ARIMA); fallback for advanced."""
+    supported_methods = ['sma', 'ema', 'linear', 'arima']
+    original_method = method
+    if method not in supported_methods:
+        method = 'sma'  # Fallback to robust SMA
+        print(f"Method {original_method} not supported; falling back to SMA.")
+    
+    # Fetch history with indicators
+    hist = get_cached_history(ticker, history_days)
+    if len(hist) < 20:  # Min for basic methods
+        raise ValueError(f"Insufficient history for {ticker}; need at least 20 days.")
+    
+    df = pd.DataFrame(hist)
+    df['price_gbp'] = pd.to_numeric(df['price_gbp'], errors='coerce')
+    df['date_num'] = pd.to_datetime(df['date']).map(lambda d: (d - pd.to_datetime(df['date'].min())).days)
+    prices = df['price_gbp'].dropna()
+    if prices.empty:
+        raise ValueError("No valid GBP prices in history")
+    
+    # Basic confidence adjust (no RSI if compute fails)
+    try:
+        df = compute_indicators(df)
+        recent_rsi = df['rsi'].tail(1).iloc[0] if 'rsi' in df.columns else None
+        confidence_adjust = 0.9 if recent_rsi and 30 < recent_rsi < 70 else 1.0
+    except:
+        confidence_adjust = 1.0
+        recent_rsi = None
+    
+    predictions = []
+    last_date = pd.to_datetime(df['date'].max())
+    rates = load_rates_sorted()
+    last_rate = get_rate_for_date(last_date.date(), rates) or Decimal('1')
+    
+    if method == 'sma':
+        window = min(20, len(prices))
+        base_pred = safe_decimal(prices.tail(window).mean())
+        pred_type = f"SMA_{window}"
+        for i in range(1, horizon + 1):
+            pred_date = last_date + pd.Timedelta(days=i)  # Simple day offset
+            pred_price_gbp = base_pred
+            pred_price_usd = pred_price_gbp * last_rate
+            confidence = float(1 - (prices.std() / prices.mean())) if prices.std() > 0 else 1.0
+            confidence = max(0.5, min(1.0, confidence * confidence_adjust))
+            predictions.append({
+                'date': pred_date.date().isoformat(),
+                'predicted_price_gbp': float(q2(pred_price_gbp)),
+                'predicted_price_usd': float(q6(pred_price_usd)),
+                'confidence': confidence,
+                'lower_ci': float(q2(pred_price_gbp * Decimal(str(1 - confidence)))),
+                'upper_ci': float(q2(pred_price_gbp * Decimal(str(1 + confidence)))),
+                'rsi': recent_rsi,
+                'macd': df['macd'].tail(1).iloc[0] if 'macd' in df.columns else None
+            })
+            # Cache only if successful
+            try:
+                sd = StockData(
+                    ticker=ticker,
+                    date=pred_date.date(),
+                    price_usd=pred_price_usd,
+                    price_gbp=pred_price_gbp,
+                    is_prediction=True,
+                    prediction_type=pred_type,
+                    prediction_json=json.dumps({'base': float(base_pred), 'confidence': confidence}),
+                    notes=f"Predicted {method} horizon {i}"
+                )
+                db.session.add(sd)
+            except Exception as cache_err:
+                print(f"Cache error: {cache_err}")
+    
+    elif method == 'ema':
+        span = 12
+        ema_series = prices.ewm(span=span).mean()
+        base_pred = safe_decimal(ema_series.iloc[-1])
+        pred_type = f"EMA_{span}"
+        alpha = Decimal('2') / Decimal(str(span + 1))
+        current_ema = base_pred
+        for i in range(1, horizon + 1):
+            pred_date = last_date + pd.Timedelta(days=i)
+            pred_price_gbp = current_ema
+            pred_price_usd = pred_price_gbp * last_rate
+            confidence = Decimal('0.8') * Decimal(str(confidence_adjust))
+            predictions.append({
+                'date': pred_date.date().isoformat(),
+                'predicted_price_gbp': float(q2(pred_price_gbp)),
+                'predicted_price_usd': float(q6(pred_price_usd)),
+                'confidence': float(confidence),
+                'lower_ci': float(q2(pred_price_gbp * (Decimal('1') - confidence))),
+                'upper_ci': float(q2(pred_price_gbp * (Decimal('1') + confidence))),
+                'rsi': recent_rsi,
+                'macd': df['macd'].tail(1).iloc[0] if 'macd' in df.columns else None
+            })
+            try:
+                sd = StockData(
+                    ticker=ticker,
+                    date=pred_date.date(),
+                    price_usd=pred_price_usd,
+                    price_gbp=pred_price_gbp,
+                    is_prediction=True,
+                    prediction_type=pred_type,
+                    prediction_json=json.dumps({'base_ema': float(base_pred), 'alpha': str(alpha), 'confidence': float(confidence)}),
+                    notes=f"Predicted {method} horizon {i}"
+                )
+                db.session.add(sd)
+            except Exception as cache_err:
+                print(f"Cache error: {cache_err}")
+            current_ema = alpha * pred_price_gbp + (Decimal('1') - alpha) * current_ema
+    
+    elif method == 'linear':
+        x = df['date_num'].tail(len(prices)).values
+        y = prices.values
+        slope, intercept, r_value, _, _ = linregress(x, y)
+        confidence = float(r_value ** 2) * confidence_adjust
+        pred_type = "Linear_Reg"
+        for i in range(1, horizon + 1):
+            pred_date = last_date + pd.Timedelta(days=i)
+            days_ahead = i
+            pred_price_gbp = safe_decimal(intercept + slope * (x[-1] + days_ahead))
+            pred_price_gbp = max(Decimal('0.01'), pred_price_gbp)
+            pred_price_usd = pred_price_gbp * last_rate
+            predictions.append({
+                'date': pred_date.date().isoformat(),
+                'predicted_price_gbp': float(q2(pred_price_gbp)),
+                'predicted_price_usd': float(q6(pred_price_usd)),
+                'confidence': confidence,
+                'lower_ci': float(q2(pred_price_gbp * Decimal(str(1 - confidence)))),
+                'upper_ci': float(q2(pred_price_gbp * Decimal(str(1 + confidence)))),
+                'rsi': recent_rsi,
+                'macd': df['macd'].tail(1).iloc[0] if 'macd' in df.columns else None
+            })
+            try:
+                sd = StockData(
+                    ticker=ticker,
+                    date=pred_date.date(),
+                    price_usd=pred_price_usd,
+                    price_gbp=pred_price_gbp,
+                    is_prediction=True,
+                    prediction_type=pred_type,
+                    prediction_json=json.dumps({'slope': slope, 'intercept': intercept, 'r_squared': confidence}),
+                    notes=f"Predicted {method} horizon {i}"
+                )
+                db.session.add(sd)
+            except Exception as cache_err:
+                print(f"Cache error: {cache_err}")
+    
+    elif method == 'arima':
+        try:
+            model = ARIMA(prices, order=(1,1,1))
+            fitted = model.fit()
+            forecast = fitted.forecast(steps=horizon)
+            pred_type = "ARIMA_1-1-1"
+            aic = fitted.aic
+            for i in range(horizon):
+                pred_date = last_date + pd.Timedelta(days=i + 1)
+                pred_price_gbp = safe_decimal(forecast.iloc[i])
+                pred_price_usd = pred_price_gbp * last_rate
+                confidence = Decimal('0.75') * Decimal(str(confidence_adjust))  # ARIMA base confidence
+                predictions.append({
+                    'date': pred_date.date().isoformat(),
+                    'predicted_price_gbp': float(q2(pred_price_gbp)),
+                    'predicted_price_usd': float(q6(pred_price_usd)),
+                    'confidence': float(confidence),
+                    'lower_ci': float(q2(pred_price_gbp * (Decimal('1') - confidence))),
+                    'upper_ci': float(q2(pred_price_gbp * (Decimal('1') + confidence))),
+                    'rsi': recent_rsi,
+                    'macd': df['macd'].tail(1).iloc[0] if 'macd' in df.columns else None
+                })
+                try:
+                    sd = StockData(
+                        ticker=ticker,
+                        date=pred_date.date(),
+                        price_usd=pred_price_usd,
+                        price_gbp=pred_price_gbp,
+                        is_prediction=True,
+                        prediction_type=pred_type,
+                        prediction_json=json.dumps({'aic': aic, 'order': (1,1,1), 'confidence': float(confidence)}),
+                        notes=f"Predicted {method} horizon {i+1}"
+                    )
+                    db.session.add(sd)
+                except Exception as cache_err:
+                    print(f"Cache error: {cache_err}")
+        except Exception as e:
+            print(f"ARIMA failed for {ticker}: {e}; falling back to SMA.")
+            return predict_prices(ticker, 'sma', horizon, history_days)  # Recursive fallback
+    
+    try:
+        db.session.commit()
+    except Exception as commit_err:
+        print(f"Commit error: {commit_err}")
+    
+    return predictions
+
+
+def optimize_sell(ticker: str, horizon: int = 30, shares_fraction: float = 1.0) -> dict:
+    """Optimize sell: Simulate sales at predictions, compute after-tax profit."""
+    try:
+        # Get predictions (use SMA as default for conservatism)
+        preds = predict_prices(ticker, method="sma", horizon=horizon)
+        if not preds:
+            raise ValueError("No predictions available")
+
+        # Get current pool snapshot
+        latest_snapshot = PoolSnapshot.query.order_by(PoolSnapshot.timestamp.desc()).first()
+        if not latest_snapshot or safe_decimal(latest_snapshot.total_shares) <= 0:
+            raise ValueError("No share pool available; run full recalc_all first")
+    
+        total_shares = safe_decimal(latest_snapshot.total_shares)
+        shares_to_sell = total_shares * Decimal(str(shares_fraction))
+        avg_cost = safe_decimal(latest_snapshot.avg_cost_gbp)
+        total_cost = avg_cost * shares_to_sell
+
+        simulations = []
+        max_net_profit = Decimal('0')
+        optimal = None
+
+        # Defaults for CGT approximation (single hypothetical sale)
+        non_savings_income = Decimal('0')
+        basic_threshold = Decimal('37700')
+        basic_band_available = max(Decimal('0'), basic_threshold - non_savings_income)
+        total_carry_forward_loss = Decimal('0')  # Assume no for future single sale
+
+        for pred in preds:
+            pred_date_str = pred['date']
+            pred_date = date.fromisoformat(pred_date_str)
+            pred_price_gbp = Decimal(str(pred['predicted_price_gbp']))
+            proceeds = shares_to_sell * pred_price_gbp
+            gross_profit = proceeds - total_cost
+            gain = gross_profit  # For single sale
+
+            net_gain = max(Decimal('0'), gain)
+            net_gain_after_losses = max(Decimal('0'), net_gain - total_carry_forward_loss)
+            cgt_allowance = get_aea(pred_date.year)
+            taxable_gain = max(Decimal('0'), net_gain_after_losses - cgt_allowance)
+            basic_taxable = min(taxable_gain, basic_band_available)
+            higher_taxable = taxable_gain - basic_taxable
+            estimated_cgt = q2(basic_taxable * Decimal('0.10') + higher_taxable * Decimal('0.20'))
+            net_profit = gross_profit - estimated_cgt
+
+            sim = {
+                'date': pred_date_str,
+                'predicted_price_gbp': float(pred_price_gbp),
+                'proceeds_gbp': float(proceeds),
+                'total_cost_gbp': float(total_cost),
+                'gross_profit_gbp': float(gross_profit),
+                'estimated_cgt_gbp': float(estimated_cgt),
+                'net_profit_gbp': float(net_profit),
+                'confidence': pred.get('confidence', 0.5)
+            }
+            simulations.append(sim)
+
+            if net_profit > max_net_profit:
+                max_net_profit = net_profit
+                optimal = sim
+
+        # Cache optimal as prediction note or separate, but for now return
+        result = {
+            'ticker': ticker,
+            'horizon_days': horizon,
+            'shares_fraction': shares_fraction,
+            'simulations': simulations,
+            'optimal_sell': optimal,
+            'max_net_profit_gbp': float(max_net_profit),
+            'disclaimer': 'Predictions and simulations are estimates only; CGT approximated for single future sale assuming no other disposals, current settings, and basic rate where applicable. Consult a tax advisor for accurate advice. Assumes current pool avg cost for Section 104 matching.'
+        }
+
+        return result
+
+    except Exception as e:
+        print(f"Error in optimize_sell for {ticker}: {e}")
+        return {'error': f'Optimization failed: {str(e)}', 'simulations': [], 'disclaimer': 'Predictions and simulations are estimates only; consult a tax advisor. Assumes current pool and tax settings.'}
+
+
+# ---------- Stock API Endpoints ----------
+@app.route("/api/stock/track", methods=["POST"])
+def set_stock_ticker():
+    data = request.json or {}
+    ticker = data.get("ticker", "").upper().strip()
+    if not ticker or len(ticker) > 10:
+        return jsonify({"error": "Invalid ticker"}), 400
+    setting = Setting.query.get("DefaultStockTicker")
+    if setting:
+        setting.value = ticker
+    else:
+        setting = Setting(key="DefaultStockTicker", value=ticker)
+        db.session.add(setting)
+    db.session.commit()
+    return jsonify({"success": True, "ticker": ticker})
+
+
+@app.route("/api/stock/current")
+def get_stock_current():
+    ticker = request.args.get("ticker", "").upper().strip()
+    if not ticker:
+        setting = Setting.query.get("DefaultStockTicker")
+        ticker = setting.value if setting else None
+    if not ticker:
+        return jsonify({"error": "No ticker specified or default set"}), 400
+    
+    # Check cache for today
+    today = date.today()
+    cached = StockData.query.filter_by(ticker=ticker, date=today, is_prediction=False).first()
+    if cached and (date.today() - cached.date).days == 0:  # Same day
+        return jsonify({
+            "ticker": ticker,
+            "date": cached.date.isoformat(),
+            "price_usd": float(cached.price_usd),
+            "price_gbp": float(cached.price_gbp) if cached.price_gbp else None,
+            "volume": cached.volume,
+            "from_cache": True
+        })
+    
+    # Fetch latest
+    try:
+        stock = yf.Ticker(ticker)
+        try:
+            info = stock.info
+            if not info or 'symbol' not in info:
+                raise ValueError(f"Invalid ticker {ticker}")
+        except Exception:
+            return jsonify({"error": f"Invalid ticker {ticker}"}), 400
+        hist = stock.history(period="1d")
+        if hist.empty or 'Close' not in hist.columns:
+            return jsonify({"error": f"Failed to fetch current data for {ticker}"}), 500
+        
+        latest_close = hist['Close'].iloc[-1]
+        volume = int(hist['Volume'].iloc[-1]) if 'Volume' in hist else None
+        rate = get_rate_for_date(today, load_rates_sorted())
+        latest_close_dec = safe_decimal(latest_close)
+        price_gbp = latest_close_dec / rate if rate != 0 else latest_close_dec
+        
+        # Cache
+        sd = StockData(
+            ticker=ticker,
+            date=today,
+            price_usd=safe_decimal(latest_close),
+            price_gbp=safe_decimal(price_gbp),
+            volume=volume,
+            notes=f"Fetched from yfinance on {datetime.now().isoformat()}"
+        )
+        db.session.add(sd)
+        db.session.commit()
+        
+        return jsonify({
+            "ticker": ticker,
+            "date": today.isoformat(),
+            "price_usd": float(latest_close),
+            "price_gbp": float(price_gbp),
+            "volume": volume,
+            "from_cache": False
+        })
+    except ValueError:
+        raise  # Re-raise for API error
+    except Exception as e:
+        print(f"yfinance current failed for {ticker}: {e}")
+        return jsonify({"error": f"Failed to fetch current data for {ticker}"}), 500
+
+
+@app.route("/api/stock/optimize")
+def get_stock_optimize():
+    ticker = request.args.get("ticker", "").upper().strip()
+    horizon = int(request.args.get("horizon", 30))
+    shares_fraction = float(request.args.get("fraction", 1.0))
+
+    if not ticker:
+        setting = Setting.query.get("DefaultStockTicker")
+        ticker = setting.value if setting else None
+    if not ticker:
+        return jsonify({"error": "No ticker specified or default set"}), 400
+
+    try:
+        opt = optimize_sell(ticker, horizon=horizon, shares_fraction=shares_fraction)
+        return jsonify(opt)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/stock/predict")
+def get_stock_predict():
+    ticker = request.args.get("ticker", "").upper().strip()
+    method = request.args.get("method", "sma")
+    horizon = int(request.args.get("horizon", 30))
+
+    if not ticker:
+        setting = Setting.query.get("DefaultStockTicker")
+        ticker = setting.value if setting else None
+    if not ticker:
+        return jsonify({"error": "No ticker specified or default set"}), 400
+
+    try:
+        preds = predict_prices(ticker, method=method, horizon=horizon)
+        return jsonify({"ticker": ticker, "method": method, "horizon": horizon, "predictions": preds})
+    except Exception as e:
+        print(f"Predict error for {ticker} ({method}): {e}")
+        # Fallback to SMA if other method fails
+        if method != 'sma':
+            try:
+                preds = predict_prices(ticker, method='sma', horizon=horizon)
+                return jsonify({"ticker": ticker, "method": "sma (fallback)", "horizon": horizon, "predictions": preds, "note": f"Original {method} failed; used SMA."})
+            except:
+                pass
+        return jsonify({"error": f"Prediction failed: {str(e)}. Try SMA method or check backend logs."}), 500
+
+
+@app.route("/api/stock/history")
+def get_stock_history():
+    ticker = request.args.get("ticker", "").upper().strip()
+    days = int(request.args.get("days", 100))
+
+    if not ticker:
+        setting = Setting.query.get("DefaultStockTicker")
+        ticker = setting.value if setting else None
+    if not ticker:
+        return jsonify({"error": "No ticker specified or default set"}), 400
+
+    try:
+        hist = get_cached_history(ticker, days=days)
+        if not hist:
+            raise ValueError("No historical data available")
+        return jsonify({"ticker": ticker, "days": days, "history": hist})
+    except Exception as e:
+        print(f"History error for {ticker}: {e}")
+        return jsonify({"error": f"History fetch failed: {str(e)}. Ensure yfinance installed and network OK."}), 500
+
+
 @app.route("/api/snapshot/<int:year>")
 def api_snapshot(year):
     snapshot = PoolSnapshot.query.filter_by(tax_year=year).order_by(PoolSnapshot.timestamp.desc()).first()
@@ -1456,25 +2149,25 @@ def api_summary(year):
         DisposalResult.sale_date <= tax_end
     ).order_by(DisposalResult.sale_date.asc()).all()
     
-    total_proceeds = sum([safe_decimal(r.proceeds_gbp or 0) for r in disposals])
-    total_cost = sum([safe_decimal(r.cost_basis_gbp or 0) for r in disposals])
-    total_gain = sum([safe_decimal(r.gain_gbp or 0) for r in disposals])
-    pos = sum([safe_decimal(r.gain_gbp) for r in disposals if safe_decimal(r.gain_gbp) > 0])
-    neg = sum([abs(safe_decimal(r.gain_gbp)) for r in disposals if safe_decimal(r.gain_gbp) < 0])
+    total_proceeds = safe_decimal(sum([safe_decimal(r.proceeds_gbp or 0) for r in disposals]))
+    total_cost = safe_decimal(sum([safe_decimal(r.cost_basis_gbp or 0) for r in disposals]))
+    total_gain = safe_decimal(sum([safe_decimal(r.gain_gbp or 0) for r in disposals]))
+    pos = safe_decimal(sum([safe_decimal(r.gain_gbp) for r in disposals if safe_decimal(r.gain_gbp) > 0]))
+    neg = safe_decimal(sum([abs(safe_decimal(r.gain_gbp)) for r in disposals if safe_decimal(r.gain_gbp) < 0]))
     net_gain = pos - neg
     if net_gain < 0:
         net_gain = Decimal("0")
     
     # Apply carry-forward losses from previous years
     carry_forward_losses = CarryForwardLoss.query.filter(CarryForwardLoss.tax_year < year).all()
-    total_carry_forward_loss = sum(safe_decimal(loss.amount) for loss in carry_forward_losses)
+    total_carry_forward_loss = safe_decimal(sum(safe_decimal(loss.amount) for loss in carry_forward_losses))
     
     # Subtract carry-forward losses from net gain before applying allowance
     net_gain_after_losses = max(Decimal("0"), net_gain - total_carry_forward_loss)
     
-    sa = Setting.query.get("CGT_Allowance")
-    sc = Setting.query.get("NonSavingsIncome")
-    sd = Setting.query.get("BasicBandThreshold")
+    sa = db.session.get(Setting, "CGT_Allowance")
+    sc = db.session.get(Setting, "NonSavingsIncome")
+    sd = db.session.get(Setting, "BasicBandThreshold")
     cgt_allowance = safe_decimal(sa.value) if sa and safe_decimal(sa.value) > 0 and year < 2024 else get_aea(year)
     non_savings_income = safe_decimal(sc.value) if sc else Decimal("0")
     basic_threshold = safe_decimal(sd.value) if sd else Decimal("37700")
@@ -1921,6 +2614,28 @@ def ensure_db_schema():
             """)
     except Exception:
         pass
+
+    # StockData table
+    try:
+        c.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='stock_data'")
+        if not c.fetchone():
+            c.execute("""
+                CREATE TABLE stock_data (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ticker VARCHAR(10) NOT NULL,
+                    date DATE NOT NULL,
+                    price_usd NUMERIC(28,6) NOT NULL,
+                    price_gbp NUMERIC(28,6),
+                    volume INTEGER,
+                    is_prediction BOOLEAN DEFAULT 0,
+                    prediction_type VARCHAR(20),
+                    prediction_json TEXT,
+                    notes VARCHAR(200),
+                    INDEX idx_ticker_date (ticker, date)
+                )
+            """)
+    except Exception:
+        pass
     try:
         c.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='vesting'")
         if c.fetchone():
@@ -1970,11 +2685,78 @@ def bootstrap():
     with app.app_context():
         ensure_db_schema()
         db.create_all()
-        if not Setting.query.get("CGT_Allowance"): db.session.add(Setting(key="CGT_Allowance", value="0"))  # 0 means use dynamic
-        if not Setting.query.get("CGT_Rate"): db.session.add(Setting(key="CGT_Rate", value="20"))
-        if not Setting.query.get("NonSavingsIncome"): db.session.add(Setting(key="NonSavingsIncome", value="0"))
-        if not Setting.query.get("BasicBandThreshold"): db.session.add(Setting(key="BasicBandThreshold", value="37700"))
+        if not db.session.get(Setting, "CGT_Allowance"): db.session.add(Setting(key="CGT_Allowance", value="0"))  # 0 means use dynamic
+        if not db.session.get(Setting, "CGT_Rate"): db.session.add(Setting(key="CGT_Rate", value="20"))
+        if not db.session.get(Setting, "NonSavingsIncome"): db.session.add(Setting(key="NonSavingsIncome", value="0"))
+        if not db.session.get(Setting, "BasicBandThreshold"): db.session.add(Setting(key="BasicBandThreshold", value="37700"))
         db.session.commit()
+
+# API for recalc (trigger CGT recalc for tax year, generate audit steps)
+@app.route("/api/recalc", methods=["POST"])
+def api_recalc():
+    data = request.json
+    if not data or "tax_year" not in data:
+        return jsonify({"error": "Missing tax_year in request body"}), 400
+    try:
+        tax_year = int(data["tax_year"])
+        print(f"DEBUG: Full recalc triggered by API for tax_year: {tax_year}")
+        # Perform a full recalculation, clearing all previous results to ensure consistent pool state
+        with recalc_lock:
+            DisposalResult.query.delete()
+            PoolSnapshot.query.delete()
+            CalculationStep.query.delete()
+            CalculationDetail.query.delete()
+            db.session.commit()
+
+            # Always do full recalc, ignoring tax_year_filter for the recalc itself to ensure order-independent results
+            res = recalc_all(explain=True, tax_year_filter=None)
+            db.session.commit()  # Ensure steps and summaries saved
+        return jsonify({
+            "success": True,
+            "tax_year": tax_year,
+            "errors_present": res.get("errors_present", False),
+            "taxable_summary": res.get("taxable_summary", {}),
+            "disclaimer": "Recalc completed. Audit logs generated for CGT disposals (e.g., Section 104 pooling, gains after allowance). Consult HMRC for final tax."
+        })
+    except ValueError as ve:
+        db.session.rollback()
+        return jsonify({"error": f"Invalid tax_year: {str(ve)}"}), 400
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"error": f"Recalc failed: {str(e)}. Ensure data integrity for UK CGT calculations."}), 500
+
+# API for calculation steps (audit logs)
+@app.route("/api/calculation-steps")
+def api_calculation_steps():
+    tax_year_str = request.args.get("tax_year")
+    sale_id_str = request.args.get("sale_id")
+    if tax_year_str:
+        tax_year = int(tax_year_str)
+        tax_start = date(tax_year, 4, 6)
+        tax_end = date(tax_year + 1, 4, 5)
+        # Filter steps by sales in tax year
+        sales_in_year = SaleInput.query.filter(
+            SaleInput.date >= tax_start,
+            SaleInput.date <= tax_end
+        ).all()
+        sale_ids = [s.id for s in sales_in_year]
+        steps = CalculationStep.query.filter(
+            CalculationStep.sale_input_id.in_(sale_ids)
+        ).order_by(CalculationStep.sale_input_id, CalculationStep.step_order).all()
+    elif sale_id_str:
+        sale_id = int(sale_id_str)
+        steps = CalculationStep.query.filter_by(sale_input_id=sale_id).order_by(CalculationStep.step_order).all()
+    else:
+        steps = CalculationStep.query.order_by(CalculationStep.timestamp.desc()).limit(100).all()
+    
+    steps_list = [{
+        "id": s.id,
+        "timestamp": s.timestamp.isoformat() if s.timestamp else None,
+        "sale_input_id": s.sale_input_id,
+        "step_order": s.step_order,
+        "message": s.message
+    } for s in steps]
+    return jsonify({"steps": steps_list})
 
 if __name__ == "__main__":
     bootstrap()
